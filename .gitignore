@@ -1,0 +1,86 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+
+# Virtual Environments
+venv/
+.venv/
+env/
+ENV/
+virtualenv/
+pip-wheel-metadata/
+
+# Environment / Secrets
+.env
+.env.*
+*.env
+*.key
+*.pem
+*.crt
+*.p12
+api_keys.yaml
+configs/api_keys.yaml
+
+# Data (NEVER COMMIT)
+data/raw/
+data/interim/
+data/processed/
+*.csv
+*.tsv
+*.parquet
+*.jsonl
+*.zip
+
+# Logs / Outputs
+logs/
+*.log
+*.out
+
+# Jupyter / Colab
+.ipynb_checkpoints/
+*.nbconvert.ipynb
+*-checkpoint.ipynb
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Testing / Coverage
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.tox/
+
+# ML / Experiment Artifacts
+checkpoints/
+models/
+runs/
+wandb/
+mlruns/
+
+# Temporary / Scratch
+tmp/
+temp/
+.cache/
+
+# Downloads
+*.tar
+*.gz
+*.bz2
+*.7z
+
+# Local Config Overrides
+configs/local_*.yaml
+configs/*.local.yaml
