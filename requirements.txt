@@ -1,0 +1,19 @@
+# Core
+pandas
+numpy
+requests
+tqdm
+python-dotenv
+
+# Finance / Market Data
+finance-datareader==0.9.101
+dart-fss==0.4.15
+
+# Parsing / Utils
+beautifulsoup4
+lxml
+pyyaml
+
+# Dev / Debug
+ipykernel
+jupyter
