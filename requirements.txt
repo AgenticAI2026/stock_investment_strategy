@@ -17,3 +17,7 @@ pyyaml
 # Dev / Debug
 ipykernel
 jupyter
+
+# Pipeline
+prefect
+langgraph

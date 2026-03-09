@@ -32,6 +32,7 @@ configs/api_keys.yaml
 data/raw/
 data/interim/
 data/processed/
+artifacts/
 *.csv
 *.tsv
 *.parquet
