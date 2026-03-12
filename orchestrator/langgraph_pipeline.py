@@ -5,7 +5,7 @@ from core.context import RunContext
 from core.artifacts import ArtifactPaths
 
 # agents
-from agents.ingest.agent import IngestAgent
+from agents.ingest.agent import DataIngestionAgent
 # from agents.feature_table.agent import FeatureTableAgent
 # from agents.prep_reco.agent import PreprocessingRecommenderAgent
 # from agents.model_match_v1.agent import ModelMatchV1Agent
