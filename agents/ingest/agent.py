@@ -1190,3 +1190,20 @@ class DataIngestionAgent:
         self._save_run_summary(summary)
         print("✅ DataIngestionAgent run() 완료:", summary)
         return summary
+    
+    # -------------------------------------------------
+    # LangGraph 실행 인터페이스
+    # -------------------------------------------------
+    def execute(self, ctx=None, params=None):
+
+        summary = self.run()
+
+        return {
+            "status": "success",
+            "data": summary
+        }
+
+
+if __name__ == "__main__":
+    agent = DataIngestionAgent()
+    agent.run()
