@@ -5,7 +5,7 @@ from core.context import RunContext
 from core.artifacts import ArtifactPaths
 
 # agents
-from agents.ingest.agent import IngestAgent
+from agents.ingest.agent import DataIngestionAgent
 # from agents.feature_table.agent import FeatureTableAgent
 # from agents.prep_reco.agent import PreprocessingRecommenderAgent
 # from agents.model_match_v1.agent import ModelMatchV1Agent
@@ -43,7 +43,7 @@ def run_agent(agent):
 
         result = agent.execute(ctx, ap)
 
-        if result.status == "failed":
+        if result.get("status") == "failed":
             return {"status": "failed"}
 
         return {"status": "success"}
@@ -59,7 +59,17 @@ def build_pipeline():
     graph = StateGraph(PipelineState)
 
     # nodes
-    graph.add_node("ingest", run_agent(IngestAgent()))
+    graph.add_node(
+        "ingest",
+        run_agent(
+            DataIngestionAgent(
+                user_csv_map={
+                    "event_log": "data/raw/user/user_event_log.csv",
+                    "profile": "data/raw/user/user_profile.csv",
+                }
+            )
+        ),
+    )
     # graph.add_node("feature_table", run_agent(FeatureTableAgent()))
     # graph.add_node("prep_reco", run_agent(PreprocessingRecommenderAgent()))
     # graph.add_node("model_match_v1", run_agent(ModelMatchV1Agent()))
