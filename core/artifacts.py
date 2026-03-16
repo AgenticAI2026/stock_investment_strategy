@@ -23,21 +23,22 @@ class ArtifactPaths:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
 
+    # -------------------------------------------------
+    # Stage 폴더 생성
+    # -------------------------------------------------
+
     def stage_dir(self, stage: str) -> Path:
-        """
-        stage별 폴더 생성
-        """
         path = self.root / stage
         path.mkdir(parents=True, exist_ok=True)
         return path
 
     def file(self, stage: str, filename: str) -> Path:
-        """
-        stage 내부 파일 경로 반환
-        """
         return self.stage_dir(stage) / filename
 
-    # -------- 공통 stage 폴더 --------
+
+    # -------------------------------------------------
+    # Stage 폴더
+    # -------------------------------------------------
 
     def ingest_dir(self) -> Path:
         return self.stage_dir("ingest")
@@ -57,13 +58,41 @@ class ArtifactPaths:
     def report_dir(self) -> Path:
         return self.stage_dir("report")
 
-    # -------- stage별 대표 파일 --------
+
+    # -------------------------------------------------
+    # Feature Table
+    # -------------------------------------------------
+
+    def price_features(self) -> Path:
+        return self.file("feature_table", "price_features.csv")
+
+    def finance_features(self) -> Path:
+        return self.file("feature_table", "finance_features.csv")
+
+    def news_features(self) -> Path:
+        return self.file("feature_table", "news_features.csv")
+
+    def user_features(self) -> Path:
+        return self.file("feature_table", "user_features.csv")
 
     def feature_table(self) -> Path:
-        return self.file("feature_table", "feature_table.parquet")
+        return self.file("feature_table", "feature_table.csv")
+
+
+    # -------------------------------------------------
+    # Preprocessing
+    # -------------------------------------------------
 
     def preprocessing_plan(self) -> Path:
         return self.file("prep", "preprocessing_plan.json")
+
+    def preprocessed_dataset(self) -> Path:
+        return self.file("prep", "preprocessed_dataset.csv")
+
+
+    # -------------------------------------------------
+    # Model
+    # -------------------------------------------------
 
     def model_selection_v1(self) -> Path:
         return self.file("model", "model_selection_v1.json")
@@ -71,10 +100,20 @@ class ArtifactPaths:
     def model_selection_v2(self) -> Path:
         return self.file("model", "model_selection_v2.json")
 
-    def inference_signals(self) -> Path:
-        return self.file("inference", "signals.parquet")
 
-    def report_md(self) -> Path:
+    # -------------------------------------------------
+    # Inference
+    # -------------------------------------------------
+
+    def inference_signals(self) -> Path:
+        return self.file("inference", "signals.csv")
+
+
+    # -------------------------------------------------
+    # Report
+    # -------------------------------------------------
+
+    def report(self) -> Path:
         return self.file("report", "report.md")
 
     def validation_result(self) -> Path:

@@ -1195,9 +1195,11 @@ class DataIngestionAgent:
     # LangGraph 실행 인터페이스
     # -------------------------------------------------
     def execute(self, ctx=None, params=None):
-
+        
+        print("🚀 Data Ingestion Start")
         summary = self.run()
 
+        print("✅ Data Ingestion Complete")
         return {
             "status": "success",
             "data": summary
