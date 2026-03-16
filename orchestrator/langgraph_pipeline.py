@@ -6,7 +6,7 @@ from core.artifacts import ArtifactPaths
 
 # agents
 from agents.ingest.agent import DataIngestionAgent
-# from agents.feature_table.agent import FeatureTableAgent
+from agents.feature_table.agent import FeatureExtractionAgent
 # from agents.prep_reco.agent import PreprocessingRecommenderAgent
 # from agents.model_match_v1.agent import ModelMatchV1Agent
 # from agents.prep_apply_v1.agent import PreprocessingImplementorV1Agent
@@ -70,7 +70,7 @@ def build_pipeline():
             )
         ),
     )
-    # graph.add_node("feature_table", run_agent(FeatureTableAgent()))
+    graph.add_node("feature_table", run_agent(FeatureExtractionAgent()))
     # graph.add_node("prep_reco", run_agent(PreprocessingRecommenderAgent()))
     # graph.add_node("model_match_v1", run_agent(ModelMatchV1Agent()))
     # graph.add_node("prep_apply_v1", run_agent(PreprocessingImplementorV1Agent()))
@@ -86,7 +86,7 @@ def build_pipeline():
     # edges
     graph.set_entry_point("ingest")
 
-    # graph.add_edge("ingest", "feature_table")
+    graph.add_edge("ingest", "feature_table")
     # graph.add_edge("feature_table", "prep_reco")
     # graph.add_edge("prep_reco", "model_match_v1")
     # graph.add_edge("model_match_v1", "prep_apply_v1")
@@ -100,6 +100,6 @@ def build_pipeline():
     # graph.add_edge("report_validate", "shortform_rag")
 
     # graph.add_edge("shortform_rag", END)
-    graph.add_edge("ingest", END)
+    graph.add_edge("feature_table", END)
 
     return graph.compile()
