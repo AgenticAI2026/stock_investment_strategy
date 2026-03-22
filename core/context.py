@@ -1,3 +1,4 @@
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from datetime import datetime
@@ -16,6 +17,23 @@ class RunContext:
     project_root: Path
     artifact_root: Path
     flags: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def logger(self):
+        logger = logging.getLogger(f"pipeline.{self.run_id}")
+
+        if not logger.handlers:
+            handler = logging.StreamHandler()
+            formatter = logging.Formatter(
+                "[%(asctime)s] %(levelname)s - %(message)s"
+            )
+            handler.setFormatter(formatter)
+            logger.addHandler(handler)
+
+            logger.propagate = False
+
+        logger.setLevel(logging.INFO)
+        return logger
 
     @staticmethod
     def create(project_root: Path, asof_date: str, universe: str):

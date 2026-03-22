@@ -6,7 +6,7 @@ from orchestrator.prefect_flow import daily_run
 def main():
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--date", default=None)
+    parser.add_argument("--date", default="2026-03-18")
     parser.add_argument("--universe", default="KOSPI100")
 
     args = parser.parse_args()

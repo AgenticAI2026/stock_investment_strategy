@@ -8,7 +8,9 @@ import time
 import shutil
 import datetime as dt
 from html import unescape
+from pathlib import Path
 from typing import Optional, Dict, Any, List
+import traceback
 
 import requests
 import pandas as pd
@@ -18,11 +20,15 @@ from zoneinfo import ZoneInfo
 
 from utils.env_loader import load_env
 
+from core.agent_base import BaseAgent
+from core.context import RunContext
+from core.artifacts import ArtifactPaths
+from core.result import StageResult
 
-class DataIngestionAgent:
-    # =========================================================
-    # ✅ KIS endpoints / TR IDs (환경에 따라 조정 가능)
-    # =========================================================
+
+class DataIngestionAgent(BaseAgent):
+    stage = "ingest"
+
     KIS_VOLUME_RANK_ENDPOINT = "/uapi/domestic-stock/v1/quotations/volume-rank"
     KIS_VOLUME_RANK_TR_ID = "FHPST01710000"
 
@@ -33,70 +39,42 @@ class DataIngestionAgent:
         self,
         dart_api_key: Optional[str] = None,
         user_csv_map: Optional[Dict[str, str]] = None,
-        data_dir: str = "data/raw",              # 원천 데이터 읽기 기준
-        artifacts_root: str = "artifacts",       # 실행 결과 저장 루트
-        run_id: Optional[str] = None,            # 전체 파이프라인에서 주입 권장
-        stage_name: str = "ingest",              # 현재 agent stage
+        data_dir: str = "data/raw",
     ):
-        # ✅ .env 로드 (프로젝트 루트)
         load_env()
 
         self.data_dir = data_dir
         self.user_csv_map = user_csv_map or {}
 
-        # Keys (가능하면 .env에서 읽고, 필요 시 인자로 override)
         self.dart_api_key = dart_api_key or os.getenv("DART_API_KEY")
         self.naver_client_id = os.getenv("NAVER_CLIENT_ID")
         self.naver_client_secret = os.getenv("NAVER_CLIENT_SECRET")
 
-        # -------------------------
-        # run_id / artifacts 경로
-        # -------------------------
-        self.artifacts_root = artifacts_root
-        self.stage_name = stage_name
-        self.run_id = run_id or dt.datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y%m%dT%H%M%S")
-
-        self.run_root = os.path.join(self.artifacts_root, f"run_id={self.run_id}")
-        self.stage_root = os.path.join(self.run_root, self.stage_name)
-
-        self.user_dir = os.path.join(self.stage_root, "user")
-        self.meta_dir = os.path.join(self.stage_root, "meta")
-        self.price_dir = os.path.join(self.stage_root, "price")
-        self.finance_dir = os.path.join(self.stage_root, "finance")
-        self.news_dir = os.path.join(self.stage_root, "news")
-
-        os.makedirs(self.user_dir, exist_ok=True)
-        os.makedirs(self.meta_dir, exist_ok=True)
-        os.makedirs(self.price_dir, exist_ok=True)
-        os.makedirs(self.finance_dir, exist_ok=True)
-        os.makedirs(self.news_dir, exist_ok=True)
-
-        # 세션
-        self.session = requests.Session()
-        self.session.headers.update({"User-Agent": "Mozilla/5.0"})
-
-        # Universe cache
-        self.universe_top100: Optional[pd.DataFrame] = None
-
-        # KIS (한국투자증권)
         self.kis_app_key = os.getenv("KIS_APP_KEY")
         self.kis_app_secret = os.getenv("KIS_APP_SECRET")
-        self.kis_base_url = os.getenv("KIS_BASE_URL", "https://openapi.koreainvestment.com:9443")
+        self.kis_base_url = os.getenv(
+            "KIS_BASE_URL",
+            "https://openapi.koreainvestment.com:9443",
+        )
 
         self._kis_access_token: Optional[str] = None
         self._kis_token_expire_at: Optional[dt.datetime] = None
 
-        # Warnings
-        if self.naver_client_id is None or self.naver_client_secret is None:
-            print("[WARN] NAVER_CLIENT_ID / NAVER_CLIENT_SECRET 이 설정되지 않았습니다. 뉴스 수집이 실패할 수 있어요.")
-        if self.dart_api_key is None:
-            print("[WARN] DART_API_KEY 가 설정되지 않았습니다. 재무 수집이 실패할 수 있어요.")
-        if self.kis_app_key is None or self.kis_app_secret is None:
-            print("[WARN] KIS_APP_KEY / KIS_APP_SECRET 이 설정되지 않았습니다. 시세 수집이 실패할 수 있어요.")
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": "Mozilla/5.0"})
 
-    # --------------------------
-    # util (뉴스/파일명/경로)
-    # --------------------------
+        self.universe_top100: Optional[pd.DataFrame] = None
+
+        if self.naver_client_id is None or self.naver_client_secret is None:
+            print("[WARN] NAVER_CLIENT_ID / NAVER_CLIENT_SECRET 이 설정되지 않았습니다.")
+        if self.dart_api_key is None:
+            print("[WARN] DART_API_KEY 가 설정되지 않았습니다.")
+        if self.kis_app_key is None or self.kis_app_secret is None:
+            print("[WARN] KIS_APP_KEY / KIS_APP_SECRET 이 설정되지 않았습니다.")
+
+    # =========================================================
+    # util
+    # =========================================================
     def _safe_name(self, s: str, max_len: int = 80) -> str:
         s = str(s) if s is not None else ""
         s = re.sub(r"[^가-힣A-Za-z0-9]+", "_", s)
@@ -120,47 +98,55 @@ class DataIngestionAgent:
             q = f"{name} (주가 OR 실적 OR 공시)"
         return q
 
-    def _artifact_path(self, category: str, filename: str) -> str:
-        mapping = {
-            "user": self.user_dir,
-            "meta": self.meta_dir,
-            "price": self.price_dir,
-            "finance": self.finance_dir,
-            "news": self.news_dir,
-        }
-        if category not in mapping:
-            raise ValueError(f"Unknown category: {category}")
-        return os.path.join(mapping[category], filename)
+    def _to_float(self, v, default=0.0) -> float:
+        try:
+            if v is None or v == "":
+                return default
+            return float(str(v).replace(",", ""))
+        except Exception:
+            return default
 
-    def _latest_universe_csv_path(self) -> str:
-        return self._artifact_path("meta", "top100_liquidity_latest.csv")
+    def _to_int(self, v, default=0) -> int:
+        try:
+            if v is None or v == "":
+                return default
+            return int(float(str(v).replace(",", "")))
+        except Exception:
+            return default
 
-    def _save_run_summary(self, summary: Dict[str, Any]) -> None:
-        out_path = os.path.join(self.stage_root, "ingest_summary.json")
-        with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(summary, f, ensure_ascii=False, indent=2)
-        print(f"🧾 ingest summary 저장 → {out_path}")
-
-    # --------------------------
-    # 0) 사용자 데이터 로드/저장
-    # --------------------------
-    def ingest_user_data(self, user_csv_map: dict) -> dict:
-        saved_paths = {}
-
-        for role, csv_path in user_csv_map.items():
-            if not os.path.exists(csv_path):
-                raise FileNotFoundError(f"{role} CSV not found: {csv_path}")
-
-            dst_path = self._artifact_path("user", f"user_{role}.csv")
-            shutil.copy2(csv_path, dst_path)
-
-            print(f"✅ 사용자 데이터 저장 완료 → {dst_path}")
-            saved_paths[role] = dst_path
-
-        return saved_paths
+    def _fmt_date(self, yyyymmdd: Optional[str]) -> str:
+        if yyyymmdd and len(yyyymmdd) == 8:
+            return f"{yyyymmdd[:4]}-{yyyymmdd[4:6]}-{yyyymmdd[6:]}"
+        return dt.date.today().isoformat()
 
     # =========================================================
-    # ✅ KIS 토큰/헤더 + 공통 request
+    # user ingest
+    # =========================================================
+    def ingest_user_data(self, user_csv_map, ap):
+        saved = {}
+
+        if "profile" not in user_csv_map:
+            raise ValueError("user_csv_map missing 'profile'")
+
+        profile_src = user_csv_map["profile"]
+        profile_dst = ap.file("ingest/user", "user_profile.csv")
+
+        shutil.copy2(profile_src, profile_dst)
+        saved["profile"] = str(profile_dst)
+
+        if "event" not in user_csv_map:
+            raise ValueError("user_csv_map missing 'event'")
+
+        event_src = user_csv_map["event"]
+        event_dst = ap.file("ingest/user", "user_event_log.csv")
+
+        shutil.copy2(event_src, event_dst)
+        saved["event"] = str(event_dst)
+
+        return saved
+    
+    # =========================================================
+    # KIS helpers
     # =========================================================
     def _kis_get_access_token(self) -> str:
         if not self.kis_app_key or not self.kis_app_secret:
@@ -187,7 +173,9 @@ class DataIngestionAgent:
 
         expires_in = int(data.get("expires_in", 60 * 60 * 23))
         self._kis_access_token = token
-        self._kis_token_expire_at = dt.datetime.now() + dt.timedelta(seconds=max(expires_in - 60, 60))
+        self._kis_token_expire_at = dt.datetime.now() + dt.timedelta(
+            seconds=max(expires_in - 60, 60)
+        )
         return token
 
     def _kis_headers(self, tr_id: str) -> dict:
@@ -214,22 +202,25 @@ class DataIngestionAgent:
         base_sleep=0.3,
     ):
         last_err = None
-
         for i in range(max_retries):
             try:
                 resp = self.session.request(
-                    method, url, headers=headers, params=params, json=json, timeout=timeout
+                    method,
+                    url,
+                    headers=headers,
+                    params=params,
+                    json=json,
+                    timeout=timeout,
                 )
 
-                # ✅ 2xx/4xx는 바로 raise_for_status()로 원인 잡기
                 if resp.status_code < 500:
                     resp.raise_for_status()
                     return resp
 
-                # ✅ 5xx는 last_err에 상태/본문을 넣고 재시도
                 snippet = (resp.text or "")[:300].replace("\n", " ")
-                last_err = RuntimeError(f"HTTP {resp.status_code} from {url} | body={snippet}")
-
+                last_err = RuntimeError(
+                    f"HTTP {resp.status_code} from {url} | body={snippet}"
+                )
             except Exception as e:
                 last_err = e
 
@@ -243,24 +234,8 @@ class DataIngestionAgent:
                 return data[k]
         return []
 
-    def _to_float(self, v, default=0.0) -> float:
-        try:
-            if v is None or v == "":
-                return default
-            return float(str(v).replace(",", ""))
-        except Exception:
-            return default
-
-    def _to_int(self, v, default=0) -> int:
-        try:
-            if v is None or v == "":
-                return default
-            return int(float(str(v).replace(",", "")))
-        except Exception:
-            return default
-
     # =========================================================
-    # ✅ 1) Top100 유니버스: KIS 유동성(거래대금/거래량) 기반
+    # 1) Top100
     # =========================================================
     def _kis_fetch_volume_rank(
         self,
@@ -270,12 +245,7 @@ class DataIngestionAgent:
         price1: str = "",
         price2: str = "",
     ) -> pd.DataFrame:
-        """
-        metric:
-        - trade_value  : 거래대금 기준
-        - trade_volume : 거래량 기준
-        """
-        blng = "3" if metric == "trade_value" else "0"  # 3=거래대금 / 0=거래량
+        blng = "3" if metric == "trade_value" else "0"
 
         url = f"{self.kis_base_url}{self.KIS_VOLUME_RANK_ENDPOINT}"
         headers = self._kis_headers(tr_id=self.KIS_VOLUME_RANK_TR_ID)
@@ -298,7 +268,9 @@ class DataIngestionAgent:
         data = resp.json()
 
         if str(data.get("rt_cd")) != "0":
-            raise RuntimeError(f"volume-rank 실패: msg_cd={data.get('msg_cd')} msg1={data.get('msg1')}")
+            raise RuntimeError(
+                f"volume-rank 실패: msg_cd={data.get('msg_cd')} msg1={data.get('msg1')}"
+            )
 
         rows = data.get("output", [])
         if not isinstance(rows, list) or not rows:
@@ -328,45 +300,14 @@ class DataIngestionAgent:
         })
         return out.reset_index(drop=True)
 
-    def _kis_get_stock_market_cached(self, stock_code: str, cache: dict) -> str:
-        """
-        search-stock-info로 KOSPI/KOSDAQ 판별 (캐시)
-        """
-        stock_code = str(stock_code).zfill(6)
-        if stock_code in cache:
-            return cache[stock_code]
-
-        url = f"{self.kis_base_url}{self.KIS_SEARCH_STOCK_INFO_ENDPOINT}"
-        headers = self._kis_headers(tr_id=self.KIS_SEARCH_STOCK_INFO_TR_ID)
-        params = {"PRDT_TYPE_CD": "300", "PDNO": stock_code}
-
-        resp = self._request_with_retry("GET", url, headers=headers, params=params, timeout=15)
-        data = resp.json()
-
-        if str(data.get("rt_cd")) != "0":
-            cache[stock_code] = ""
-            return ""
-
-        out = data.get("output", {}) or {}
-        kosdaq_dt = str(out.get("kosdaq_mket_lstg_dt", "") or "").strip()
-        kospi_dt = str(out.get("scts_mket_lstg_dt", "") or "").strip()
-
-        if kosdaq_dt:
-            cache[stock_code] = "KOSDAQ"
-        elif kospi_dt:
-            cache[stock_code] = "KOSPI"
-        else:
-            cache[stock_code] = ""
-
-        return cache[stock_code]
-
     def fetch_top100_by_marcap(
         self,
+        ap: ArtifactPaths,
         top_n: int = 100,
         save_snapshot: bool = True,
         metric: str = "trade_value",
     ) -> pd.DataFrame:
-        print(f"🔍 KIS 유동성 Top{top_n} 산출 (volume-rank 다회 호출로 후보풀 확장), metric={metric}")
+        print(f"🔍 KIS 유동성 Top{top_n} 산출, metric={metric}")
 
         sort_col = "trade_value" if metric == "trade_value" else "trade_volume"
 
@@ -378,17 +319,18 @@ class DataIngestionAgent:
             ("100000", "500000"),
             ("500000", ""),
         ]
-
-        markets = [
-            ("KOSPI", "0001"),
-            ("KOSDAQ", "1001"),
-        ]
+        markets = [("KOSPI", "0001"), ("KOSDAQ", "1001")]
 
         best: Dict[str, dict] = {}
 
         for mkt_name, fid_iscd in markets:
             for p1, p2 in price_bins:
-                df = self._kis_fetch_volume_rank(metric=metric, fid_input_iscd=fid_iscd, price1=p1, price2=p2)
+                df = self._kis_fetch_volume_rank(
+                    metric=metric,
+                    fid_input_iscd=fid_iscd,
+                    price1=p1,
+                    price2=p2,
+                )
                 if df.empty:
                     continue
 
@@ -403,12 +345,11 @@ class DataIngestionAgent:
                     }
                     if (code not in best) or (row[sort_col] > best[code].get(sort_col, 0)):
                         best[code] = row
-
                 time.sleep(0.08)
 
         pool = pd.DataFrame(list(best.values()))
         if pool.empty:
-            raise RuntimeError("volume-rank 다회 호출 후에도 pool이 비었습니다. (파라미터/권한/장상태 확인 필요)")
+            raise RuntimeError("volume-rank 다회 호출 후에도 pool이 비었습니다.")
 
         top = (
             pool.sort_values(sort_col, ascending=False)
@@ -416,27 +357,27 @@ class DataIngestionAgent:
             .loc[:, ["종목명", "종목코드", "시장"]]
             .reset_index(drop=True)
         )
-        top["종목코드"] = top["종목코드"].astype(str).str.zfill(6)
 
+        top["종목코드"] = top["종목코드"].astype(str).str.zfill(6)
         self.universe_top100 = top.copy()
 
-        latest_path = self._artifact_path("meta", f"top{top_n}_liquidity_latest.csv")
+        latest_path = ap.file("ingest/meta", f"top{top_n}_liquidity_latest.csv")
         top.to_csv(latest_path, index=False, encoding="utf-8-sig")
 
         if save_snapshot:
             stamp = dt.datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y%m%d")
-            snap_path = self._artifact_path("meta", f"top{top_n}_liquidity_{stamp}.csv")
+            snap_path = ap.file("ingest/meta", f"top{top_n}_liquidity_{stamp}.csv")
             top.to_csv(snap_path, index=False, encoding="utf-8-sig")
+
             print(f"✅ Top{top_n} 저장 완료 → {latest_path} / {snap_path}")
         else:
             print(f"✅ Top{top_n} 저장 완료 → {latest_path}")
 
-        print(f"pool unique codes = {len(pool)} / top rows = {len(top)}")
         return top
 
-    # --------------------------
-    # 유니버스 시장 컬럼 보강
-    # --------------------------
+    # =========================================================
+    # 2) Price / Foreign
+    # =========================================================
     def _ensure_market_col_from_latest_universe(self, universe_csv: str | None = None):
         if self.universe_top100 is None or self.universe_top100.empty:
             return
@@ -463,9 +404,6 @@ class DataIngestionAgent:
             u[["종목코드", "시장"]], on="종목코드", how="left"
         )
 
-    # --------------------------
-    # 시장 상태
-    # --------------------------
     def _market_phase_kst(self, now: dt.datetime | None = None) -> str:
         kst = ZoneInfo("Asia/Seoul")
         now = now or dt.datetime.now(kst)
@@ -481,9 +419,6 @@ class DataIngestionAgent:
         else:
             return "post"
 
-    # --------------------------
-    # (A) 최신 30개(제한) 일봉: inquire-daily-price
-    # --------------------------
     def _kis_inquire_daily_price_list(self, stock_code: str) -> List[Dict[str, Any]]:
         url = f"{self.kis_base_url}/uapi/domestic-stock/v1/quotations/inquire-daily-price"
         headers = self._kis_headers(tr_id="FHKST01010400")
@@ -494,35 +429,16 @@ class DataIngestionAgent:
             "FID_ORG_ADJ_PRC": "0",
         }
 
-        resp = self._request_with_retry(
-            method="GET",
-            url=url,
-            headers=headers,
-            params=params,
-            timeout=15,
-        )
+        resp = self._request_with_retry("GET", url, headers=headers, params=params, timeout=15)
         data = resp.json()
         out_list = self._pick_list(data)
         if not out_list:
             raise RuntimeError(f"inquire-daily-price 응답 이상: {data}")
         return out_list
 
-    def _kis_inquire_daily_price_latest_n(self, stock_code: str, n: int = 20) -> List[Dict[str, Any]]:
-        out_list = self._kis_inquire_daily_price_list(stock_code)
-
-        def _get_date(x):
-            return x.get("stck_bsop_date") or x.get("bsop_date") or x.get("date") or ""
-
-        out_list_sorted = sorted(out_list, key=_get_date, reverse=True)
-        return out_list_sorted[:n]
-
-    # --------------------------
-    # (B) 장기 일봉: inquire-daily-itemchartprice
-    # --------------------------
     def _kis_inquire_daily_itemchartprice(self, stock_code: str, start: str, end: str) -> list:
         url = f"{self.kis_base_url}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
         headers = self._kis_headers(tr_id="FHKST03010100")
-
         params = {
             "FID_COND_MRKT_DIV_CODE": "J",
             "FID_INPUT_ISCD": str(stock_code).zfill(6),
@@ -534,69 +450,13 @@ class DataIngestionAgent:
 
         resp = self._request_with_retry("GET", url, headers=headers, params=params, timeout=15)
         data = resp.json()
-
         out_list = data.get("output2", [])
 
         if isinstance(out_list, list) and len(out_list) == 0:
-            msg_cd = data.get("msg_cd")
-            msg1 = data.get("msg1")
-            rt_cd = data.get("rt_cd")
-            print(f"[WARN] itemchartprice output2 empty: code={stock_code}, rt_cd={rt_cd}, msg_cd={msg_cd}, msg1={msg1}")
             return []
-
         if not isinstance(out_list, list):
-            keys = list(data.keys())
-            raise RuntimeError(f"itemchartprice output2 형식이상: keys={keys}, sample={str(data)[:200]}")
-
+            raise RuntimeError(f"itemchartprice output2 형식이상: {str(data)[:200]}")
         return out_list
-
-    # --------------------------
-    # 파서
-    # --------------------------
-    def _fmt_date(self, yyyymmdd: Optional[str]) -> str:
-        if yyyymmdd and len(yyyymmdd) == 8:
-            return f"{yyyymmdd[:4]}-{yyyymmdd[4:6]}-{yyyymmdd[6:]}"
-        return dt.date.today().isoformat()
-
-    def _kis_extract_ohlcv_from_daily_row(self, it: dict, source: str) -> dict:
-        def _get_date(x):
-            return x.get("stck_bsop_date") or x.get("bsop_date") or x.get("date") or ""
-
-        d = self._fmt_date(_get_date(it))
-
-        o = it.get("stck_oprc") or it.get("open")
-        h = it.get("stck_hgpr") or it.get("high")
-        l = it.get("stck_lwpr") or it.get("low")
-        c = it.get("stck_clpr") or it.get("close") or it.get("stck_prpr")
-        v = it.get("acml_vol") or it.get("volume")
-
-        return {
-            "date": d,
-            "open": self._to_float(o),
-            "high": self._to_float(h),
-            "low": self._to_float(l),
-            "close": self._to_float(c),
-            "volume": self._to_int(v),
-            "source": source,
-        }
-
-    def _kis_extract_realtime_from_inquire_price(self, out: dict) -> dict:
-        date_fmt = self._fmt_date(out.get("stck_bsop_date"))
-        return {
-            "date": date_fmt,
-            "open": self._to_float(out.get("stck_oprc")),
-            "high": self._to_float(out.get("stck_hgpr")),
-            "low": self._to_float(out.get("stck_lwpr")),
-            "close": self._to_float(out.get("stck_prpr")),
-            "volume": self._to_int(out.get("acml_vol")),
-            "source": "inquire-price",
-        }
-
-    # --------------------------
-    # 오늘 외국인 스냅샷
-    # --------------------------
-    def _kis_inquire_price_domestic(self) -> Dict[str, Any]:
-        raise NotImplementedError("Use _kis_inquire_price_domestic(stock_code)")
 
     def _kis_inquire_price_domestic(self, stock_code: str) -> Dict[str, Any]:
         url = f"{self.kis_base_url}/uapi/domestic-stock/v1/quotations/inquire-price"
@@ -605,27 +465,43 @@ class DataIngestionAgent:
             "FID_COND_MRKT_DIV_CODE": "J",
             "FID_INPUT_ISCD": str(stock_code).zfill(6),
         }
-        resp = self._request_with_retry(
-            method="GET",
-            url=url,
-            headers=headers,
-            params=params,
-            timeout=15,
-        )
-
+        resp = self._request_with_retry("GET", url, headers=headers, params=params, timeout=15)
         data = resp.json()
         if "output" not in data:
             raise RuntimeError(f"inquire-price 응답 이상: {data}")
         return data["output"]
 
-    # --------------------------
-    # main: OHLCV hist(n_days) + today(as-of)
-    # --------------------------
+    def _kis_extract_ohlcv_from_daily_row(self, it: dict, source: str) -> dict:
+        d = it.get("stck_bsop_date") or it.get("bsop_date") or it.get("date") or ""
+        return {
+            "date": self._fmt_date(d),
+            "open": self._to_float(it.get("stck_oprc") or it.get("open")),
+            "high": self._to_float(it.get("stck_hgpr") or it.get("high")),
+            "low": self._to_float(it.get("stck_lwpr") or it.get("low")),
+            "close": self._to_float(
+                it.get("stck_clpr") or it.get("close") or it.get("stck_prpr")
+            ),
+            "volume": self._to_int(it.get("acml_vol") or it.get("volume")),
+            "source": source,
+        }
+
+    def _kis_extract_realtime_from_inquire_price(self, out: dict) -> dict:
+        return {
+            "date": self._fmt_date(out.get("stck_bsop_date")),
+            "open": self._to_float(out.get("stck_oprc")),
+            "high": self._to_float(out.get("stck_hgpr")),
+            "low": self._to_float(out.get("stck_lwpr")),
+            "close": self._to_float(out.get("stck_prpr")),
+            "volume": self._to_int(out.get("acml_vol")),
+            "source": "inquire-price",
+        }
+
     def fetch_ohlcv_last_n_days_for_top100(
         self,
+        ap: ArtifactPaths,
         n_days: int = 365,
         sleep_sec: float = 0.12,
-        out_filename: str = "top100_ohlcv_last365.csv",
+        out_filename: str = "price_ohlcv.csv",
         min_required_hist: int = 365,
     ) -> pd.DataFrame:
         if self.universe_top100 is None or self.universe_top100.empty:
@@ -798,22 +674,23 @@ class DataIngestionAgent:
         df["row_order"] = df["row_type"].map(row_order).fillna(9).astype(int)
         df = df.sort_values(["종목코드", "row_order", "date"], ascending=[True, True, True]).reset_index(drop=True)
         df = df.drop(columns=["row_order"])
+        
+        path = ap.price_ohlcv()
+        df.to_csv(path, index=False, encoding="utf-8-sig")
 
-        out_path = self._artifact_path("price", out_filename)
-        df.to_csv(out_path, index=False, encoding="utf-8-sig")
-        print(f"✅ OHLCV(hist {n_days}+today) 저장 완료 → {out_path} (rows={len(df)})")
         return df
 
     def fetch_foreign_snapshot_today_for_top100(
         self,
+        ap: ArtifactPaths,
         sleep_sec: float = 0.05,
-        out_filename: str = "top100_foreign_snapshot_today.csv",
+        out_filename: str = "price_foreign.csv",
     ) -> pd.DataFrame:
         if self.universe_top100 is None or self.universe_top100.empty:
             raise RuntimeError("Top100 universe is empty. Run fetch_top100_by_marcap() first.")
-        self._ensure_market_col_from_latest_universe()
 
         rows = []
+
         for _, r in tqdm(
             self.universe_top100.iterrows(),
             total=len(self.universe_top100),
@@ -826,7 +703,6 @@ class DataIngestionAgent:
 
             try:
                 out = self._kis_inquire_price_domestic(code)
-
                 date_fmt = self._fmt_date(out.get("stck_bsop_date"))
                 vol = self._to_int(out.get("acml_vol"))
                 frgn_net = self._to_int(out.get("frgn_ntby_qty"))
@@ -843,7 +719,6 @@ class DataIngestionAgent:
                     "foreign_net_flow_ratio": (frgn_net / vol) if vol > 0 else 0.0,
                     "source": "inquire-price",
                 })
-
             except Exception as e:
                 rows.append({
                     "date": dt.date.today().isoformat(),
@@ -857,26 +732,20 @@ class DataIngestionAgent:
                     "source": "ERROR",
                     "error": str(e)[:200],
                 })
-
             time.sleep(sleep_sec)
 
         df = pd.DataFrame(rows)
-
-        out_path = self._artifact_path("price", out_filename)
+        out_path = ap.file("ingest/price", out_filename)
         df.to_csv(out_path, index=False, encoding="utf-8-sig")
-        print(f"✅ 외국인 스냅샷(오늘) 저장 완료 → {out_path} (rows={len(df)})")
+        print(f"✅ 외국인 스냅샷 저장 완료 → {out_path}")
         return df
 
-    def fetch_prices_minimal_bundle_top100(self, n_days: int = 365) -> dict:
-        ohlcv_df = self.fetch_ohlcv_last_n_days_for_top100(n_days=n_days)
-        foreign_df = self.fetch_foreign_snapshot_today_for_top100()
-        return {"ohlcv_last_n_days": ohlcv_df, "foreign_snapshot_today": foreign_df}
-
-    # --------------------------
-    # 3) 재무제표 수집
-    # --------------------------
+    # =========================================================
+    # 3) Financial
+    # =========================================================
     def fetch_financials_topN_from_csv(
         self,
+        ap: ArtifactPaths,
         csv_path=None,
         start_year=2015,
         end_year=None,
@@ -887,10 +756,10 @@ class DataIngestionAgent:
         return_concat=False,
     ):
         if not self.dart_api_key:
-            raise RuntimeError("❌ DART API 키가 없습니다.")
+            raise RuntimeError("DART API 키가 없습니다.")
 
         if csv_path is None:
-            csv_path = self._latest_universe_csv_path()
+            csv_path = ap.file("ingest/meta", "top100_liquidity_latest.csv")
 
         if end_year is None:
             end_year = dt.datetime.today().year
@@ -902,15 +771,6 @@ class DataIngestionAgent:
         session.headers.update({"User-Agent": "Mozilla/5.0"})
 
         df = pd.read_csv(csv_path)
-        os.makedirs(self.finance_dir, exist_ok=True)
-
-        report_labels = {
-            "11011": "사업보고서(연간)",
-            "11012": "반기보고서",
-            "11013": "1분기보고서",
-            "11014": "3분기보고서",
-        }
-
         all_concat = []
 
         for _, row in tqdm(df.iterrows(), total=len(df), ncols=90, desc="재무제표"):
@@ -919,7 +779,6 @@ class DataIngestionAgent:
 
             corp = corp_list.find_by_stock_code(code)
             if not corp:
-                print(f"⚠️ [{name}] corp_code 매핑 실패 → skip")
                 continue
 
             corp_code = corp.corp_code
@@ -936,8 +795,7 @@ class DataIngestionAgent:
 
                         try:
                             res = session.get(url, timeout=20).json()
-                        except Exception as e:
-                            print(f"❌ [{name}] {year} {report_labels.get(rc, rc)} {fs_div} 요청 오류: {e}")
+                        except Exception:
                             continue
 
                         if (not isinstance(res, dict)) or res.get("status") != "000" or "list" not in res:
@@ -948,12 +806,11 @@ class DataIngestionAgent:
                         part["종목명"] = name
                         part["year"] = year
                         part["reprt_code"] = rc
-                        part["reprt_label"] = report_labels.get(rc, rc)
                         part["fs_div"] = fs_div
                         parts.append(part)
 
                         time.sleep(sleep_sec)
-                        break  # CFS 성공 시 OFS 생략
+                        break
 
                     time.sleep(sleep_sec)
 
@@ -962,25 +819,27 @@ class DataIngestionAgent:
 
                 if save_per_stock:
                     safe = self._safe_name(name)
-                    out_path = self._artifact_path("finance", f"{code}_{safe}_financials_{start_year}_{end_year}.csv")
+                    out_path = ap.file(
+                        "ingest/finance",
+                        f"{code}_{safe}_financials_{start_year}_{end_year}.csv",
+                    )
+
                     out.to_csv(out_path, index=False, encoding="utf-8-sig")
-                    print(f"✅ [{name}] 저장 → {out_path} (rows={len(out)})")
 
                 if return_concat:
                     all_concat.append(out)
-            else:
-                print(f"⚠️ [{name}] {start_year}~{end_year} 재무제표 데이터 없음")
 
         if return_concat and all_concat:
             return pd.concat(all_concat, ignore_index=True)
 
         return pd.DataFrame()
 
-    # --------------------------
-    # 4) 네이버 뉴스 검색 API 수집 (Top100 기준)
-    # --------------------------
+    # =========================================================
+    # 4) News
+    # =========================================================
     def fetch_news_for_top100_via_naver_api(
         self,
+        ap: ArtifactPaths,
         display=100,
         max_pages=10,
         sort="date",
@@ -998,7 +857,7 @@ class DataIngestionAgent:
         client_id = os.getenv("NAVER_CLIENT_ID")
         client_secret = os.getenv("NAVER_CLIENT_SECRET")
         if not client_id or not client_secret:
-            raise RuntimeError("환경변수 NAVER_CLIENT_ID / NAVER_CLIENT_SECRET 가 필요합니다.")
+            raise RuntimeError("NAVER_CLIENT_ID / NAVER_CLIENT_SECRET 가 필요합니다.")
 
         url = "https://openapi.naver.com/v1/search/news.json"
         headers = {"X-Naver-Client-Id": client_id, "X-Naver-Client-Secret": client_secret}
@@ -1017,8 +876,7 @@ class DataIngestionAgent:
                     resp = self.session.get(url, headers=headers, params=params, timeout=15)
                     resp.raise_for_status()
                     data = resp.json()
-                except Exception as e:
-                    print(f"⚠️ 뉴스 호출 실패: {code}({name}) / {query} - {e}")
+                except Exception:
                     break
 
                 items = data.get("items", [])
@@ -1069,20 +927,14 @@ class DataIngestionAgent:
             code = str(r["종목코드"]).zfill(6)
 
             seen_stock = set()
-
             query1 = self._build_news_query(name)
             items_all = _fetch_one_query(query1, code, name, seen_stock)
 
             if fill_to_keep and keep_per_stock is not None and len(items_all) < int(keep_per_stock):
-                query2 = name
-                items_all += _fetch_one_query(query2, code, name, seen_stock)
+                items_all += _fetch_one_query(name, code, name, seen_stock)
 
             df_stock = pd.DataFrame(items_all)
-
-            base_cols = ["종목코드", "종목명", "title", "description", "link", "originallink", "pubDate", "fetched_at"]
-            if df_stock.empty:
-                df_stock = pd.DataFrame(columns=base_cols)
-            else:
+            if not df_stock.empty:
                 df_stock["pub_dt"] = pd.to_datetime(df_stock["pubDate"], errors="coerce", utc=True)
                 df_stock = (
                     df_stock.sort_values("pub_dt", ascending=False, na_position="last")
@@ -1093,7 +945,7 @@ class DataIngestionAgent:
 
             if save_per_stock:
                 safe = self._safe_name(name)
-                out_path = self._artifact_path("news", f"{code}_{safe}_naver_news.csv")
+                out_path = ap.file("ingest/news", f"{code}_{safe}_naver_news.csv")
                 df_stock.to_csv(out_path, index=False, encoding="utf-8-sig")
 
             merged.append(df_stock)
@@ -1105,107 +957,126 @@ class DataIngestionAgent:
         )
 
         if save_merged:
-            out_path = self._artifact_path("news", "top100_naver_news_merged.csv")
+            out_path = ap.file("ingest/news", "top100_naver_news_merged.csv")
             merged_df.to_csv(out_path, index=False, encoding="utf-8-sig")
             print(f"🧾 Top100 뉴스 합본 저장 → {out_path} (rows={len(merged_df)})")
 
         return merged_df
 
-    # --------------------------
-    # run() - 실행 엔트리
-    # --------------------------
-    def run(self) -> dict:
+    # =========================================================
+    # core-compatible run
+    # =========================================================
+    def run(self, ctx: RunContext, ap: ArtifactPaths) -> StageResult:
+        print("🚀 Data Ingestion Start")
+        print(f"run_id={ctx.run_id}")
+        print(f"artifact_root={ctx.artifact_root}")
+
         summary: Dict[str, Any] = {
-            "run_id": self.run_id,
-            "run_root": self.run_root,
-            "stage_root": self.stage_root,
-            "stage_name": self.stage_name,
+            "run_id": ctx.run_id,
+            "artifact_root": str(ctx.artifact_root),
+            "stage_name": self.stage,
+            "asof_date": ctx.asof_date,
+            "universe": ctx.universe,
         }
 
-        # 0) user
+        outputs = []
+
         try:
+            # -------------------------
+            # user
+            # -------------------------
             if self.user_csv_map:
-                saved_user_paths = self.ingest_user_data(self.user_csv_map)
+                saved_user_paths = self.ingest_user_data(self.user_csv_map, ap)
                 summary["user_files_saved"] = saved_user_paths
-        except Exception as e:
-            summary["user_error"] = str(e)
+                outputs.extend(saved_user_paths.values())
 
-        # 1) top100
-        try:
-            top100 = self.fetch_top100_by_marcap(top_n=100, save_snapshot=True, metric="trade_value")
+            # -------------------------
+            # Top100
+            # -------------------------
+            top100 = self.fetch_top100_by_marcap(
+                ap=ap,
+                top_n=100,
+                save_snapshot=True,
+                metric="trade_value"
+            )
+
             summary["top100_rows"] = len(top100)
-            summary["top100_path"] = self._latest_universe_csv_path()
-        except Exception as e:
-            summary["top100_error"] = str(e)
-            self._save_run_summary(summary)
-            raise
 
-        # 2) prices
-        try:
+            top_path = ap.file("ingest/meta", "top100_liquidity_latest.csv")
+            summary["top100_path"] = str(top_path)
+            outputs.append(str(top_path))
+
+            # -------------------------
+            # OHLCV
+            # -------------------------
             ohlcv_df = self.fetch_ohlcv_last_n_days_for_top100(
+                ap=ap,
                 n_days=365,
                 sleep_sec=0.12,
                 out_filename="top100_ohlcv_last365.csv",
                 min_required_hist=365,
             )
-            summary["ohlcv_hist_today_rows"] = len(ohlcv_df)
-            summary["ohlcv_path"] = self._artifact_path("price", "top100_ohlcv_last365.csv")
-        except Exception as e:
-            summary["ohlcv_error"] = str(e)
 
-        try:
-            foreign_df = self.fetch_foreign_snapshot_today_for_top100()
-            summary["foreign_snapshot_today_rows"] = len(foreign_df)
-            summary["foreign_path"] = self._artifact_path("price", "top100_foreign_snapshot_today.csv")
-        except Exception as e:
-            summary["foreign_error"] = str(e)
+            summary["ohlcv_rows"] = len(ohlcv_df)
 
-        # 3) financials
-        try:
+            ohlcv_path = ap.file("ingest/price", "top100_ohlcv_last365.csv")
+            summary["ohlcv_path"] = str(ohlcv_path)
+            outputs.append(str(ohlcv_path))
+
+            # -------------------------
+            # Foreign
+            # -------------------------
+            foreign_df = self.fetch_foreign_snapshot_today_for_top100(
+                ap=ap
+            )
+
+            summary["foreign_rows"] = len(foreign_df)
+
+            foreign_path = ap.file("ingest/price", "top100_foreign_snapshot_today.csv")
+            summary["foreign_path"] = str(foreign_path)
+            outputs.append(str(foreign_path))
+
+            # -------------------------
+            # Financial
+            # -------------------------
             fin = self.fetch_financials_topN_from_csv(
-                csv_path=self._latest_universe_csv_path(),
+                ap=ap,
                 start_year=2015,
                 reprt_codes=("11011",),
                 save_per_stock=True,
                 return_concat=False,
             )
-            summary["financials_concat_rows"] = len(fin)
-            summary["finance_dir"] = self.finance_dir
-        except Exception as e:
-            summary["financials_error"] = str(e)
 
-        # 4) news
-        try:
+            summary["financials_rows"] = len(fin)
+
+            finance_dir = ap.stage_dir("ingest/finance")
+            summary["finance_dir"] = str(finance_dir)
+            outputs.append(str(finance_dir))
+
+            # -------------------------
+            # News
+            # -------------------------
             news = self.fetch_news_for_top100_via_naver_api(
+                ap=ap,
                 display=50,
                 max_pages=2,
                 keep_per_stock=50,
                 dedupe_global=False,
             )
+
             summary["news_rows"] = len(news)
-            summary["news_merged_path"] = self._artifact_path("news", "top100_naver_news_merged.csv")
+
+            news_path = ap.file("ingest/news", "top100_naver_news_merged.csv")
+            summary["news_merged_path"] = str(news_path)
+            outputs.append(str(news_path))
+
+            return StageResult.success(
+                stage=self.stage,
+                outputs=outputs,
+                metrics=summary,
+            )
+
         except Exception as e:
-            summary["news_error"] = str(e)
-
-        self._save_run_summary(summary)
-        print("✅ DataIngestionAgent run() 완료:", summary)
-        return summary
-    
-    # -------------------------------------------------
-    # LangGraph 실행 인터페이스
-    # -------------------------------------------------
-    def execute(self, ctx=None, params=None):
-        
-        print("🚀 Data Ingestion Start")
-        summary = self.run()
-
-        print("✅ Data Ingestion Complete")
-        return {
-            "status": "success",
-            "data": summary
-        }
-
-
-if __name__ == "__main__":
-    agent = DataIngestionAgent()
-    agent.run()
+            summary["fatal_error"] = str(e)
+            traceback.print_exc()
+            raise
