@@ -213,6 +213,15 @@ class FeatureExtractionAgent:
         ohlcv = pd.read_csv(ap.price_ohlcv())
         foreign = pd.read_csv(ap.price_foreign())
 
+        MIN_PERIODS = 20
+        MA_WINDOWS = [20, 60, 120, 240]
+        Z_WINDOWS = [20, 60, 120]
+        LIQ_WINDOWS = [20, 60]
+        VOL_WINDOWS = [20, 60, 120, 252]
+        DD_WINDOWS = [60, 120, 252]
+        RSI_WINDOWS = [14, 28]
+        ATR_WINDOW = 14
+
         # ===============================
         # Utils
         # ===============================
@@ -220,6 +229,18 @@ class FeatureExtractionAgent:
             a = pd.to_numeric(a, errors="coerce")
             b = pd.to_numeric(b, errors="coerce")
             return np.where((b.isna()) | (b == 0), np.nan, a / b)
+        
+        def rolling_pct_rank(series: pd.Series, window=20, minp=20):
+            s = pd.to_numeric(series, errors="coerce").to_numpy()
+            out = np.full(len(s), np.nan, dtype=float)
+            for i in range(len(s)):
+                start = max(0, i - window + 1)
+                w = s[start:i + 1]
+                w = w[~np.isnan(w)]
+                if len(w) < minp or np.isnan(s[i]):
+                    continue
+                out[i] = (w <= s[i]).mean()
+            return pd.Series(out, index=series.index)
 
         def rsi(series, window=14, minp=14):
             s = pd.to_numeric(series, errors="coerce")
@@ -234,18 +255,23 @@ class FeatureExtractionAgent:
         # ===============================
         # OHLCV 처리
         # ===============================
+        need_ohlcv = ["date", "종목코드", "open", "high", "low", "close", "volume", "row_type"]
+        missing = [c for c in need_ohlcv if c not in ohlcv.columns]
+        if missing:
+            raise ValueError(f"[OHLCV] 필요한 컬럼이 없습니다: {missing}\n현재 컬럼: {list(ohlcv.columns)}")
+
         ohlcv["date"] = pd.to_datetime(ohlcv["date"], errors="coerce")
         ohlcv["종목코드"] = ohlcv["종목코드"].astype(str).str.zfill(6)
-
-        ohlcv = ohlcv.sort_values(["종목코드", "date"]).reset_index(drop=True)
+        ohlcv = ohlcv.dropna(subset=["date"]).sort_values(["종목코드", "date"]).reset_index(drop=True)
 
         row_priority = {"ERROR": 0, "hist": 1, "today": 2}
-        ohlcv["_rp"] = ohlcv["row_type"].map(row_priority).fillna(1)
-
+        ohlcv["_rp"] = ohlcv["row_type"].map(row_priority).fillna(1).astype(int)
         ohlcv = (
             ohlcv.sort_values(["종목코드", "date", "_rp"])
             .drop_duplicates(["종목코드", "date"], keep="last")
-            .drop(columns="_rp")
+            .drop(columns=["_rp"])
+            .sort_values(["종목코드", "date"])
+            .reset_index(drop=True)
         )
 
         for c in ["open", "high", "low", "close", "volume"]:
@@ -256,68 +282,117 @@ class FeatureExtractionAgent:
 
         g = ohlcv.groupby("종목코드", group_keys=False)
 
-        # ---- 기본 피처
         ohlcv["prev_close"] = g["close"].shift(1)
-        ohlcv["daily_return"] = safe_div(
-            ohlcv["close"] - ohlcv["prev_close"], ohlcv["prev_close"]
+        ohlcv["daily_return"] = safe_div(ohlcv["close"] - ohlcv["prev_close"], ohlcv["prev_close"])
+        ohlcv["log_return"] = np.log(safe_div(ohlcv["close"], ohlcv["prev_close"]))
+        ohlcv["intraday_volatility"] = safe_div(ohlcv["high"] - ohlcv["low"], ohlcv["open"])
+        ohlcv["gap_return"] = safe_div(ohlcv["open"] - ohlcv["prev_close"], ohlcv["prev_close"])
+
+        tr1 = (ohlcv["high"] - ohlcv["low"]).abs()
+        tr2 = (ohlcv["high"] - ohlcv["prev_close"]).abs()
+        tr3 = (ohlcv["low"] - ohlcv["prev_close"]).abs()
+        ohlcv["true_range"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1, skipna=True)
+
+        ohlcv[f"atr_{ATR_WINDOW}"] = g["true_range"].transform(
+            lambda s: s.rolling(ATR_WINDOW, min_periods=min(ATR_WINDOW, MIN_PERIODS)).mean()
         )
-        ohlcv["log_return"] = np.log(
-            safe_div(ohlcv["close"], ohlcv["prev_close"])
-        )
 
-        ohlcv["intraday_volatility"] = safe_div(
-            ohlcv["high"] - ohlcv["low"], ohlcv["open"]
-        )
-        ohlcv["gap_return"] = safe_div(
-            ohlcv["open"] - ohlcv["prev_close"], ohlcv["prev_close"]
-        )
+        for w in MA_WINDOWS:
+            ma_col = f"ma{w}_close"
+            ohlcv[ma_col] = g["close"].transform(
+                lambda s: s.rolling(w, min_periods=min(w, MIN_PERIODS)).mean()
+            )
+            prev_ma = ohlcv.groupby("종목코드")[ma_col].shift(1)
+            ohlcv[f"ma{w}_slope"] = safe_div(ohlcv[ma_col], prev_ma) - 1
+            ohlcv[f"price_to_ma{w}"] = safe_div(ohlcv["close"], ohlcv[ma_col]) - 1
 
-        # ---- 이동평균
-        for w in [20, 60, 120, 240]:
-            ma = g["close"].transform(lambda s: s.rolling(w, min_periods=20).mean())
-            ohlcv[f"ma{w}_close"] = ma
+        for w in Z_WINDOWS:
+            meanw = g["volume"].transform(
+                lambda s: s.rolling(w, min_periods=min(w, MIN_PERIODS)).mean()
+            )
+            stdw = g["volume"].transform(
+                lambda s: s.rolling(w, min_periods=min(w, MIN_PERIODS)).std(ddof=0)
+            )
+            ohlcv[f"volume_zscore_{w}d"] = np.where(
+                (pd.isna(stdw)) | (stdw == 0),
+                np.nan,
+                (ohlcv["volume"] - meanw) / stdw,
+            )
 
-            prev_ma = ohlcv.groupby("종목코드")[f"ma{w}_close"].shift(1)
+        for w in LIQ_WINDOWS:
+            pcol = f"liquidity_percentile_{w}d"
+            scol = f"liquidity_state_{w}d"
 
-            ohlcv[f"ma{w}_slope"] = safe_div(ma, prev_ma) - 1
-            ohlcv[f"price_to_ma{w}"] = safe_div(ohlcv["close"], ma) - 1
+            ohlcv[pcol] = ohlcv.groupby("종목코드")["volume"].transform(
+                lambda s: rolling_pct_rank(s, window=w, minp=min(w, MIN_PERIODS))
+            )
 
-        # ---- 변동성
-        for w in [20, 60, 120, 252]:
-            std = g["daily_return"].transform(lambda s: s.rolling(w, min_periods=20).std())
-            ohlcv[f"ret_vol_{w}d"] = std
-            ohlcv[f"ret_vol_ann_{w}d"] = std * np.sqrt(252)
+            lp = ohlcv[pcol]
+            ohlcv[scol] = np.select(
+                [lp < 0.33, (lp >= 0.33) & (lp < 0.66), lp >= 0.66],
+                ["Low", "Medium", "High"],
+                default="Unknown",
+            )
+            ohlcv.loc[ohlcv[scol] == "Unknown", scol] = np.nan
 
-        # ---- drawdown
-        for w in [60, 120, 252]:
-            maxc = g["close"].transform(lambda s: s.rolling(w, min_periods=20).max())
+        for w in VOL_WINDOWS:
+            stdw = g["daily_return"].transform(
+                lambda s: s.rolling(w, min_periods=min(w, MIN_PERIODS)).std(ddof=0)
+            )
+            ohlcv[f"ret_vol_{w}d"] = stdw
+            ohlcv[f"ret_vol_ann_{w}d"] = stdw * np.sqrt(252)
+
+        for w in DD_WINDOWS:
+            maxc = g["close"].transform(
+                lambda s: s.rolling(w, min_periods=min(w, MIN_PERIODS)).max()
+            )
+            ohlcv[f"rolling_max_{w}d"] = maxc
             ohlcv[f"drawdown_{w}d"] = safe_div(ohlcv["close"], maxc) - 1
 
-        # ---- 52주
-        high = g["close"].transform(lambda s: s.rolling(252, min_periods=20).max())
-        low = g["close"].transform(lambda s: s.rolling(252, min_periods=20).min())
+        high_52w = g["close"].transform(
+            lambda s: s.rolling(252, min_periods=min(252, MIN_PERIODS)).max()
+        )
+        low_52w = g["close"].transform(
+            lambda s: s.rolling(252, min_periods=min(252, MIN_PERIODS)).min()
+        )
+        ohlcv["high_52w"] = high_52w
+        ohlcv["low_52w"] = low_52w
+        ohlcv["dist_to_52w_high"] = safe_div(ohlcv["close"], high_52w) - 1
+        ohlcv["dist_to_52w_low"] = safe_div(ohlcv["close"], low_52w) - 1
 
-        ohlcv["high_52w"] = high
-        ohlcv["low_52w"] = low
-        ohlcv["dist_to_52w_high"] = safe_div(ohlcv["close"], high) - 1
-        ohlcv["dist_to_52w_low"] = safe_div(ohlcv["close"], low) - 1
+        for w in RSI_WINDOWS:
+            ohlcv[f"rsi_{w}"] = g["close"].transform(lambda s: rsi(s, window=w, minp=w))
 
-        # ---- RSI
-        for w in [14, 28]:
-            ohlcv[f"rsi_{w}"] = g["close"].transform(lambda s: rsi(s, w))
+        cond_up20 = (ohlcv["close"] > ohlcv["ma20_close"]) & (ohlcv["daily_return"] > 0)
+        cond_dn20 = (ohlcv["close"] < ohlcv["ma20_close"]) & (ohlcv["daily_return"] < 0)
+        ohlcv["market_regime_20"] = np.select(
+            [cond_up20, cond_dn20], ["Up", "Down"], default="Side"
+        )
+
+        if "ma60_close" in ohlcv.columns:
+            cond_up60 = (ohlcv["close"] > ohlcv["ma60_close"]) & (ohlcv["daily_return"] > 0)
+            cond_dn60 = (ohlcv["close"] < ohlcv["ma60_close"]) & (ohlcv["daily_return"] < 0)
+            ohlcv["market_regime_60"] = np.select(
+                [cond_up60, cond_dn60], ["Up", "Down"], default="Side"
+            )
 
         # ===============================
         # FOREIGN 처리
         # ===============================
+        need_f = ["date", "종목코드", "volume", "frgn_ntby_qty", "hts_frgn_ehrt"]
+        missing_f = [c for c in need_f if c not in foreign.columns]
+        if missing_f:
+            raise ValueError(f"[FOREIGN] 필요한 컬럼이 없습니다: {missing_f}\n현재 컬럼: {list(foreign.columns)}")
+
+        foreign["date"] = pd.to_datetime(foreign["date"], errors="coerce")
         foreign["종목코드"] = foreign["종목코드"].astype(str).str.zfill(6)
+        foreign = foreign.dropna(subset=["date"]).sort_values(["종목코드", "date"]).reset_index(drop=True)
 
-        foreign["foreign_net_flow_ratio"] = safe_div(
-            foreign["frgn_ntby_qty"], foreign["volume"]
-        )
+        for c in ["volume", "frgn_ntby_qty", "hts_frgn_ehrt"]:
+            foreign[c] = pd.to_numeric(foreign[c], errors="coerce")
 
-        foreign["foreign_ownership_level"] = pd.to_numeric(
-            foreign["hts_frgn_ehrt"], errors="coerce"
-        )
+        foreign["foreign_net_flow_ratio"] = safe_div(foreign["frgn_ntby_qty"], foreign["volume"])
+        foreign["foreign_ownership_level"] = pd.to_numeric(foreign["hts_frgn_ehrt"], errors="coerce")
 
         # ===============================
         # 저장
@@ -327,8 +402,6 @@ class FeatureExtractionAgent:
 
         ohlcv.to_csv(ohlcv_path, index=False)
         foreign.to_csv(foreign_path, index=False)
-
-        ctx.logger.info("📊 Price Feature Extraction SAVED")
         
         # ============================================================
         # 11. 데이터 정의서
@@ -358,7 +431,49 @@ class FeatureExtractionAgent:
             {"feature_name": "log_return", "description_ko": "로그 수익률", "formula": "ln(close / prev_close)", "window": "1d", "notes": ""},
             {"feature_name": "intraday_volatility", "description_ko": "장중 변동성", "formula": "(high - low) / open", "window": "1d", "notes": ""},
             {"feature_name": "gap_return", "description_ko": "갭 수익률", "formula": "(open - prev_close) / prev_close", "window": "1d", "notes": ""},
+            {
+                "feature_name": "true_range",
+                "description_ko": "True Range",
+                "formula": "max(abs(high-low), abs(high-prev_close), abs(low-prev_close))",
+                "window": "1d",
+                "notes": "ATR 계산용 중간 피처",
+            },
+            {
+                "feature_name": f"atr_{ATR_WINDOW}",
+                "description_ko": f"ATR({ATR_WINDOW})",
+                "formula": f"rolling_mean(true_range,{ATR_WINDOW})",
+                "window": f"{ATR_WINDOW}d rolling",
+                "notes": "평균 진폭",
+            },
         ]
+
+        # --------------------------------------------------
+        # 거래량
+        # --------------------------------------------------
+        for w in Z_WINDOWS:
+            rows.append({
+                "feature_name": f"volume_zscore_{w}d",
+                "description_ko": f"{w}일 거래량 z-score",
+                "formula": f"(volume - rolling_mean(volume,{w})) / rolling_std(volume,{w})",
+                "window": f"{w}d rolling",
+                "notes": "비정상 거래량 탐지",
+            })
+
+        for w in LIQ_WINDOWS:
+            rows.append({
+                "feature_name": f"liquidity_percentile_{w}d",
+                "description_ko": f"{w}일 거래량 분위수",
+                "formula": f"pct_rank(volume within trailing {w}d window)",
+                "window": f"{w}d rolling",
+                "notes": "거래량의 상대적 수준",
+            })
+            rows.append({
+                "feature_name": f"liquidity_state_{w}d",
+                "description_ko": f"{w}일 거래량 상태",
+                "formula": "Low/Medium/High by percentile thresholds (0.33, 0.66)",
+                "window": f"{w}d rolling",
+                "notes": "범주형 유동성 상태",
+            })
 
         # --------------------------------------------------
         # 이동평균
@@ -403,12 +518,20 @@ class FeatureExtractionAgent:
         # --------------------------------------------------
         # 드로우다운
         # --------------------------------------------------
-        for w in [60, 120, 252]:
+        for w in DD_WINDOWS:
+            rows.append({
+                "feature_name": f"rolling_max_{w}d",
+                "description_ko": f"{w}일 롤링 최고 종가",
+                "formula": f"rolling_max(close,{w})",
+                "window": f"{w}d rolling",
+                "notes": "드로우다운 계산용 중간 피처",
+            })
             rows.append({
                 "feature_name": f"drawdown_{w}d",
                 "description_ko": f"{w}일 드로우다운",
-                "formula": "close / rolling_max - 1",
-                "window": f"{w}d"
+                "formula": f"(close / rolling_max_{w}d) - 1",
+                "window": f"{w}d rolling",
+                "notes": "최고점 대비 하락률",
             })
 
         # --------------------------------------------------
@@ -436,6 +559,20 @@ class FeatureExtractionAgent:
         # 외국인
         # --------------------------------------------------
         rows += [
+            {
+                "feature_name": "market_regime_20",
+                "description_ko": "20일 기준 시장 국면",
+                "formula": "Up if close > ma20_close and daily_return > 0, Down if close < ma20_close and daily_return < 0, else Side",
+                "window": "20d",
+                "notes": "추세 상태",
+            },
+            {
+                "feature_name": "market_regime_60",
+                "description_ko": "60일 기준 시장 국면",
+                "formula": "Up if close > ma60_close and daily_return > 0, Down if close < ma60_close and daily_return < 0, else Side",
+                "window": "60d",
+                "notes": "중기 추세 상태",
+            },
             {"feature_name": "frgn_ntby_qty",
             "description_ko": "외국인 순매수 수량(또는 순매수량)",
             "data_source": "FOREIGN snapshot",
@@ -471,7 +608,7 @@ class FeatureExtractionAgent:
 
         ctx.logger.info("📊 Price Feature Extraction SAVED")
 
-        return [str(ohlcv_path), str(foreign_path)]
+        return [str(ohlcv_path), str(foreign_path), str(dict_path)]
 
     def run_news_features(self, ap, feature_dir, ctx):
         output_dir = feature_dir / "news"
@@ -645,7 +782,7 @@ class FeatureExtractionAgent:
             event_ratio = text.str.contains(event_pat).mean()
             neg_ratio = text.str.contains(neg_pat).mean()
 
-            bins = g[col_pub].dt.floor("6H")
+            bins = g[col_pub].dt.floor("6h")
             max_bin = bins.value_counts().max()
             time_conc = max_bin / N
 
@@ -979,8 +1116,10 @@ class FeatureExtractionAgent:
             artifacts["finance"] = finance_path
 
             # Price
-            price_path = self.run_price_features(feature_dir, ctx, ap)
-            artifacts["price"] = price_path
+            price_paths = self.run_price_features(feature_dir, ctx, ap)
+            artifacts["price_ohlcv"] = price_paths[0]
+            artifacts["price_foreign"] = price_paths[1]
+            artifacts["price_dict"] = price_paths[2]
 
             # News
             news_path = self.run_news_features(ap, feature_dir, ctx)
@@ -989,8 +1128,6 @@ class FeatureExtractionAgent:
             # User
             user_path = self.run_user_features(ap, feature_dir, ctx)
             artifacts["user"] = user_path
-
-            ctx.logger.info("☑️ Feature Extraction Complete")
 
             return StageResult.success(
                 stage="feature_extraction",

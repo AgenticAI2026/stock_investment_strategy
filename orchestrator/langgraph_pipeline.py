@@ -44,7 +44,7 @@ def run_ingest(state: PipelineState) -> PipelineState:
     if result.status != "success":
         raise RuntimeError(f"Ingest failed: {result.metrics or result}")
 
-    ctx.logger.info("Ingest DONE")
+    ctx.logger.info("⭐ Ingest DONE")
 
     return {
         **state,
@@ -62,7 +62,7 @@ def run_feature_table(state: PipelineState) -> PipelineState:
     if result.status != "success":
         raise RuntimeError(f"Feature Extract failed: {getattr(result, 'error', None)}")
 
-    ctx.logger.info("Feature Extract DONE")
+    ctx.logger.info("⭐ Feature Extract DONE")
 
     return {
         **state,
