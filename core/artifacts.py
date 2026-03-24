@@ -4,10 +4,6 @@ from zoneinfo import ZoneInfo
 
 
 def make_run_root(base_dir: str = "artifacts") -> Path:
-    """
-    실행할 때마다 고유한 run_id 폴더 생성
-    예: artifacts/run_id=20260311T153000
-    """
     run_id = dt.datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y%m%dT%H%M%S")
     root = Path(base_dir) / f"run_id={run_id}"
     root.mkdir(parents=True, exist_ok=True)
@@ -15,16 +11,13 @@ def make_run_root(base_dir: str = "artifacts") -> Path:
 
 
 class ArtifactPaths:
-    """
-    pipeline artifact 경로 관리
-    """
 
     def __init__(self, root: Path):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
 
     # -------------------------------------------------
-    # Stage 폴더 생성
+    # base helpers
     # -------------------------------------------------
 
     def stage_dir(self, stage: str) -> Path:
@@ -32,12 +25,21 @@ class ArtifactPaths:
         path.mkdir(parents=True, exist_ok=True)
         return path
 
-    def file(self, stage: str, filename: str) -> Path:
-        return self.stage_dir(stage) / filename
+    def sub_dir(self, stage: str, sub: str) -> Path:
+        path = self.stage_dir(stage) / sub
+        path.mkdir(parents=True, exist_ok=True)
+        return path
 
+    def file(self, stage: str, filename: str) -> Path:
+        path = self.stage_dir(stage)
+        return path / filename
+
+    def file_in(self, stage: str, sub: str, filename: str) -> Path:
+        path = self.sub_dir(stage, sub)
+        return path / filename
 
     # -------------------------------------------------
-    # Stage 폴더
+    # Stage dirs
     # -------------------------------------------------
 
     def ingest_dir(self) -> Path:
@@ -58,66 +60,47 @@ class ArtifactPaths:
     def report_dir(self) -> Path:
         return self.stage_dir("report")
 
+    # =================================================
+    # ✅ INGEST OUTPUTS (핵심)
+    # =================================================
 
-    # -------------------------------------------------
-    # Feature Table
-    # -------------------------------------------------
+    # --- PRICE (single file)
+    def price_ohlcv(self) -> Path:
+        return self.file_in("ingest", "price", "price_ohlcv.csv")
+
+    def price_foreign(self) -> Path:
+        return self.file_in("ingest", "price", "price_foreign.csv")
+
+    # --- USER (single file)
+    def user_profile(self) -> Path:
+        return self.file_in("ingest", "user", "user_profile.csv")
+
+    def user_event_log(self) -> Path:
+        return self.file_in("ingest", "user", "user_event_log.csv")
+
+    # --- FINANCE (multi file dir)
+    def finance_dir(self) -> Path:
+        return self.sub_dir("ingest", "finance")
+
+    # --- NEWS (multi file dir)
+    def news_dir(self) -> Path:
+        return self.sub_dir("ingest", "news")
+
+    # =================================================
+    # FEATURE OUTPUTS
+    # =================================================
 
     def price_features(self) -> Path:
-        return self.file("feature_table", "price_features.csv")
+        return self.file_in("feature_table", "price", "price_features.csv")
 
-    def finance_features(self) -> Path:
-        return self.file("feature_table", "finance_features.csv")
+    def finance_features_dir(self) -> Path:
+        return self.sub_dir("feature_table", "finance")
 
     def news_features(self) -> Path:
-        return self.file("feature_table", "news_features.csv")
+        return self.file_in("feature_table", "news", "news_features.csv")
 
     def user_features(self) -> Path:
-        return self.file("feature_table", "user_features.csv")
+        return self.file_in("feature_table", "user", "user_features.csv")
 
     def feature_table(self) -> Path:
         return self.file("feature_table", "feature_table.csv")
-
-
-    # -------------------------------------------------
-    # Preprocessing
-    # -------------------------------------------------
-
-    def preprocessing_plan(self) -> Path:
-        return self.file("prep", "preprocessing_plan.json")
-
-    def preprocessed_dataset(self) -> Path:
-        return self.file("prep", "preprocessed_dataset.csv")
-
-
-    # -------------------------------------------------
-    # Model
-    # -------------------------------------------------
-
-    def model_selection_v1(self) -> Path:
-        return self.file("model", "model_selection_v1.json")
-
-    def model_selection_v2(self) -> Path:
-        return self.file("model", "model_selection_v2.json")
-
-
-    # -------------------------------------------------
-    # Inference
-    # -------------------------------------------------
-
-    def inference_signals(self) -> Path:
-        return self.file("inference", "signals.csv")
-
-
-    # -------------------------------------------------
-    # Report
-    # -------------------------------------------------
-
-    def report(self) -> Path:
-        return self.file("report", "report.md")
-
-    def validation_result(self) -> Path:
-        return self.file("report", "validation.json")
-
-    def shortform_script(self) -> Path:
-        return self.file("report", "shortform.txt")

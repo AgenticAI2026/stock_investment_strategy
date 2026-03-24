@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+from pathlib import Path
 from langgraph.graph import StateGraph, END
 from typing import TypedDict
 
@@ -19,37 +22,59 @@ from agents.feature_table.agent import FeatureExtractionAgent
 # from agents.report_validate.agent import ReportValidateAgent
 # from agents.shortform_rag.agent import ShortformRagAgent
 
-
-# -----------------------
-# Graph State
-# -----------------------
-
-class PipelineState(TypedDict):
+class PipelineState(TypedDict, total=False):
     ctx: RunContext
     ap: ArtifactPaths
     status: str
+    stage_outputs: dict
 
 
-# -----------------------
-# Agent Wrapper
-# -----------------------
+def run_ingest(state: PipelineState) -> PipelineState:
+    ctx = state["ctx"]
+    ap = state["ap"]
 
-def run_agent(agent):
+    agent = DataIngestionAgent(
+                user_csv_map={
+                    "event": "user_data/user_event_log.csv",
+                    "profile": "user_data/user_profile.csv",
+                }
+            )
+    result = agent.execute(ctx, ap)
 
-    def node(state: PipelineState):
+    if result.status != "success":
+        raise RuntimeError(f"Ingest failed: {result.metrics or result}")
 
-        ctx = state["ctx"]
-        ap = state["ap"]
+    ctx.logger.info("⭐ Ingest DONE")
 
-        result = agent.execute(ctx, ap)
+    return {
+        **state,
+        "status": result.status,
+    }
 
-        if result.get("status") == "failed":
-            return {"status": "failed"}
 
-        return {"status": "success"}
+def run_feature_table(state: PipelineState) -> PipelineState:
+    ctx = state["ctx"]
+    ap = state["ap"]
 
-    return node
+    agent = FeatureExtractionAgent()
+    result = agent.execute(ctx, ap)
+    
+    if result.status != "success":
+        raise RuntimeError(f"Feature Extract failed: {getattr(result, 'error', None)}")
 
+    ctx.logger.info("⭐ Feature Extract DONE")
+
+    return {
+        **state,
+        "status": result.status,
+        "stage_outputs": {
+            **state.get("stage_outputs", {}),
+            "feature": {
+                "summary": getattr(result, "summary", None),
+                "artifacts": getattr(result, "artifacts", None),
+            }
+        }
+    }
 
 # -----------------------
 # Build Graph
@@ -59,18 +84,8 @@ def build_pipeline():
     graph = StateGraph(PipelineState)
 
     # nodes
-    graph.add_node(
-        "ingest",
-        run_agent(
-            DataIngestionAgent(
-                user_csv_map={
-                    "event_log": "data/raw/user/user_event_log.csv",
-                    "profile": "data/raw/user/user_profile.csv",
-                }
-            )
-        ),
-    )
-    graph.add_node("feature_table", run_agent(FeatureExtractionAgent()))
+    graph.add_node("ingest",run_ingest)
+    graph.add_node("feature_table", run_feature_table)
     # graph.add_node("prep_reco", run_agent(PreprocessingRecommenderAgent()))
     # graph.add_node("model_match_v1", run_agent(ModelMatchV1Agent()))
     # graph.add_node("prep_apply_v1", run_agent(PreprocessingImplementorV1Agent()))
@@ -103,3 +118,33 @@ def build_pipeline():
     graph.add_edge("feature_table", END)
 
     return graph.compile()
+
+def make_initial_state(
+    project_root: str = ".",
+    asof_date: str = "2026-03-20",
+    universe: str = "KR_TOP100_LIQUIDITY",
+) -> PipelineState:
+    ctx = RunContext.create(
+        project_root=Path(project_root),
+        asof_date=asof_date,
+        universe=universe,
+    )
+    ap = ArtifactPaths(ctx.artifact_root)
+
+    return {
+        "ctx": ctx,
+        "ap": ap,
+        "status": "initialized",
+    }
+
+
+if __name__ == "__main__":
+    app = build_pipeline()
+    state = make_initial_state()
+
+    final_state = app.invoke(state)
+
+    print("\n=== PIPELINE DONE ===")
+    print(f"run_id       : {final_state['ctx'].run_id}")
+    print(f"artifact_root: {final_state['ctx'].artifact_root}")
+    print(f"status       : {final_state['status']}")
