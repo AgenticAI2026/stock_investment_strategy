@@ -33,31 +33,44 @@ class FeatureExtractionAgent:
                 return np.nan
             try:
                 return float(str(x).replace(",", "").strip())
-            except:
+            except Exception:
                 return np.nan
 
+        def safe_div(a, b):
+            a = _to_num(a)
+            b = _to_num(b)
+            if pd.isna(a) or pd.isna(b) or b in (0, 0.0):
+                return np.nan
+            return a / b
+
         def pick_amount(df_year, sj_div, account_ids=(), account_nms=()):
-            if isinstance(sj_div, (list, tuple)):
-                d = df_year[df_year["sj_div"].isin(sj_div)]
+            """
+            sj_div: "BS" 또는 ("IS","CIS") 같이 tuple/list/set 가능
+            """
+            if isinstance(sj_div, (list, tuple, set)):
+                d = df_year[df_year["sj_div"].isin(list(sj_div))]
             else:
                 d = df_year[df_year["sj_div"] == sj_div]
 
+            mask = pd.Series(True, index=d.index)
+
             if account_ids:
-                d = d[d["account_id"].astype(str).isin(account_ids)]
-
+                mask &= d["account_id"].astype(str).isin(list(account_ids))
             if account_nms:
-                d = d[d["account_nm"].astype(str).isin(account_nms)]
+                mask &= d["account_nm"].astype(str).isin(list(account_nms))
 
-            if d.empty:
+            m = d[mask].copy()
+            if m.empty:
                 return np.nan
 
-            d["val"] = d["thstrm_amount"].map(_to_num)
-            d = d.dropna(subset=["val"])
+            m["thstrm_amount_num"] = m["thstrm_amount"].map(_to_num)
+            m = m.dropna(subset=["thstrm_amount_num"])
 
-            if d.empty:
+            if m.empty:
                 return np.nan
 
-            return float(d.loc[d["val"].abs().idxmax(), "val"])
+            idx = m["thstrm_amount_num"].abs().idxmax()
+            return float(m.loc[idx, "thstrm_amount_num"])
 
         # ===============================
         # main loop
@@ -77,72 +90,150 @@ class FeatureExtractionAgent:
                 for y in years:
                     df_y = df[df["year"].astype(int) == y]
 
-                    revenue = pick_amount(df_y, ("IS","CIS"),
-                        account_ids=("ifrs_Revenue","ifrs-full_Revenue"))
+                    # -------------------------------
+                    # revenue
+                    # -------------------------------
+                    revenue_total = pick_amount(
+                        df_y,
+                        sj_div=("IS", "CIS"),
+                        account_ids=("ifrs_Revenue", "ifrs-full_Revenue"),
+                    )
 
-                    op_income = pick_amount(df_y, ("IS","CIS"),
-                        account_ids=("dart_OperatingIncomeLoss","ifrs_OperatingIncomeLoss"))
+                    if pd.isna(revenue_total):
+                        comps = []
+                        for aid in (
+                            "ifrs_RevenueFromSaleOfGoods",
+                            "ifrs_RevenueFromRenderingOfServices",
+                            "ifrs_RevenueFromConstructionContracts",
+                            "ifrs_OtherRevenue",
+                            "ifrs-full_RevenueFromSaleOfGoods",
+                            "ifrs-full_RevenueFromRenderingOfServices",
+                            "ifrs-full_RevenueFromConstructionContracts",
+                            "ifrs-full_OtherRevenue",
+                        ):
+                            v = pick_amount(
+                                df_y,
+                                sj_div=("IS", "CIS"),
+                                account_ids=(aid,),
+                            )
+                            if not pd.isna(v):
+                                comps.append(v)
 
-                    net_income_amt = pick_amount(df_y, ("IS","CIS"),
-                        account_ids=("ifrs_ProfitLoss",))
+                        revenue = float(np.nansum(comps)) if comps else np.nan
+                    else:
+                        revenue = revenue_total
 
-                    total_liab = pick_amount(df_y, "BS", account_nms=("부채총계",))
-                    total_equity = pick_amount(df_y, "BS", account_nms=("자본총계",))
-                    total_assets = pick_amount(df_y, "BS", account_nms=("자산총계",))
-                    current_assets = pick_amount(df_y, "BS", account_nms=("유동자산",))
-                    current_liab = pick_amount(df_y, "BS", account_nms=("유동부채",))
+                    # -------------------------------
+                    # operating income / net income
+                    # -------------------------------
+                    op_income = pick_amount(
+                        df_y,
+                        sj_div=("IS", "CIS"),
+                        account_ids=(
+                            "dart_OperatingIncomeLoss",
+                            "ifrs_OperatingIncomeLoss",
+                            "ifrs-full_OperatingIncomeLoss",
+                        ),
+                    )
 
-                    rows.append({
-                        "종목코드": ticker,
-                        "year": y,
-                        "revenue": revenue,
-                        "operating_income_amount": op_income,
-                        "net_income_amount": net_income_amt,
-                        "total_liabilities": total_liab,
-                        "total_equity": total_equity,
-                        "current_assets": current_assets,
-                        "current_liabilities": current_liab,
-                        "total_assets": total_assets,
-                    })
+                    net_income_amt = pick_amount(
+                        df_y,
+                        sj_div=("IS", "CIS"),
+                        account_ids=(
+                            "ifrs_ProfitLoss",
+                            "ifrs-full_ProfitLoss",
+                        ),
+                    )
+
+                    # -------------------------------
+                    # balance sheet items
+                    # -------------------------------
+                    total_liab = pick_amount(df_y, sj_div="BS", account_nms=("부채총계",))
+                    total_equity = pick_amount(df_y, sj_div="BS", account_nms=("자본총계",))
+                    current_assets = pick_amount(df_y, sj_div="BS", account_nms=("유동자산",))
+                    current_liab = pick_amount(df_y, sj_div="BS", account_nms=("유동부채",))
+                    total_assets = pick_amount(df_y, sj_div="BS", account_nms=("자산총계",))
+
+                    rows.append(
+                        {
+                            "종목코드":ticker,
+                            "year": y,
+                            "revenue": revenue,
+                            "operating_income_amount": op_income,
+                            "net_income_amount": net_income_amt,
+                            "total_liabilities": total_liab,
+                            "total_equity": total_equity,
+                            "current_assets": current_assets,
+                            "current_liabilities": current_liab,
+                            "total_assets": total_assets,
+                        }
+                    )
 
                 base = pd.DataFrame(rows).sort_values("year").reset_index(drop=True)
 
                 # ===============================
                 # feature 계산
                 # ===============================
-                base["revenue_yoy"] = (base["revenue"] - base["revenue"].shift(1)) / base["revenue"].shift(1)
+                base["revenue_yoy"] = (
+                    (base["revenue"] - base["revenue"].shift(1)) / base["revenue"].shift(1)
+                )
 
-                base["operating_margin"] = base["operating_income_amount"] / base["revenue"]
-                base["net_margin"] = base["net_income_amount"] / base["revenue"]
+                base["operating_income"] = base.apply(
+                    lambda r: safe_div(r["operating_income_amount"], r["revenue"]), axis=1
+                )
+                base["net_income"] = base.apply(
+                    lambda r: safe_div(r["net_income_amount"], r["revenue"]), axis=1
+                )
 
                 base["operating_income_yoy"] = (
-                    base["operating_income_amount"] - base["operating_income_amount"].shift(1)
-                ) / base["operating_income_amount"].shift(1)
+                    (base["operating_income_amount"] - base["operating_income_amount"].shift(1))
+                    / base["operating_income_amount"].shift(1)
+                )
 
-                base["debt_ratio"] = base["total_liabilities"] / base["total_equity"]
-                base["current_ratio"] = base["current_assets"] / base["current_liabilities"]
-                base["roe"] = base["net_income_amount"] / base["total_equity"]
-                base["roa"] = base["net_income_amount"] / base["total_assets"]
-                base["asset_turnover"] = base["revenue"] / base["total_assets"]
+                base["debt_ratio"] = base.apply(
+                    lambda r: safe_div(r["total_liabilities"], r["total_equity"]), axis=1
+                )
+                base["current_ratio"] = base.apply(
+                    lambda r: safe_div(r["current_assets"], r["current_liabilities"]), axis=1
+                )
+                base["roe"] = base.apply(
+                    lambda r: safe_div(r["net_income_amount"], r["total_equity"]), axis=1
+                )
+                base["roa"] = base.apply(
+                    lambda r: safe_div(r["net_income_amount"], r["total_assets"]), axis=1
+                )
+                base["asset_turnover"] = base.apply(
+                    lambda r: safe_div(r["revenue"], r["total_assets"]), axis=1
+                )
 
-                base["revenue_cagr_3y"] = (base["revenue"] / base["revenue"].shift(3)) ** (1/3) - 1
-
+                base["revenue_cagr_3y"] = (base["revenue"] / base["revenue"].shift(3)) ** (1 / 3) - 1
                 base["profit_volatility_3y"] = base["operating_income_amount"].rolling(3).std()
                 base["loss_year_count_5y"] = (base["net_income_amount"] < 0).rolling(5).sum()
-
-                out = base[[
-                    "종목코드","year",
-                    "revenue_yoy","operating_margin","net_margin",
-                    "operating_income_yoy","debt_ratio","current_ratio",
-                    "roe","roa","asset_turnover",
-                    "revenue_cagr_3y","profit_volatility_3y","loss_year_count_5y"
-                ]]
 
                 # ===============================
                 # 저장
                 # ===============================
+                out = base[
+                    [
+                        "종목코드",
+                        "year",
+                        "revenue_yoy",
+                        "operating_income",
+                        "net_income",
+                        "operating_income_yoy",
+                        "debt_ratio",
+                        "current_ratio",
+                        "roe",
+                        "roa",
+                        "asset_turnover",
+                        "revenue_cagr_3y",
+                        "profit_volatility_3y",
+                        "loss_year_count_5y",
+                    ]
+                ].copy()
+
                 out_path = output_dir / f"{ticker}_finance_features.csv"
-                out.to_csv(out_path, index=False)
+                out.to_csv(out_path, index=False, encoding="utf-8-sig")
                 outputs.append(str(out_path))
 
                 ctx.logger.info(f"☑️ {out_path.name}")
@@ -656,8 +747,6 @@ class FeatureExtractionAgent:
         df[col_pub] = pd.to_datetime(df[col_pub], errors="coerce", utc=True)
         df = df.dropna(subset=[col_pub])
 
-        df = df[df[col_pub] <= now]
-
         # ============================================================
         # 정렬
         # ============================================================
@@ -894,7 +983,7 @@ class FeatureExtractionAgent:
         NOW_YEAR = NOW_TS.year
         WINDOW_7D_START = NOW_TS - pd.Timedelta(days=7)
 
-        ctx.logger.info(f"🕒 NOW_TS: {NOW_TS}")
+        ctx.logger.info(f"🕒 NOW_TS: {NOW_TS}") 
 
         # 정렬
         event_df = event_df.sort_values(["user_id", "created_at"]).reset_index(drop=True)

@@ -121,7 +121,7 @@ def build_pipeline():
 
 def make_initial_state(
     project_root: str = ".",
-    asof_date: str = "2026-03-18",
+    asof_date: str = "2026-03-20",
     universe: str = "KR_TOP100_LIQUIDITY",
 ) -> PipelineState:
     ctx = RunContext.create(
