@@ -967,9 +967,8 @@ class DataIngestionAgent(BaseAgent):
     # core-compatible run
     # =========================================================
     def run(self, ctx: RunContext, ap: ArtifactPaths) -> StageResult:
-        print("🚀 Data Ingestion Start")
-        print(f"run_id={ctx.run_id}")
-        print(f"artifact_root={ctx.artifact_root}")
+        ctx.logger.info(f"run_id={ctx.run_id}")
+        ctx.logger.info(f"artifact_root={ctx.artifact_root}")
 
         summary: Dict[str, Any] = {
             "run_id": ctx.run_id,
@@ -1013,13 +1012,13 @@ class DataIngestionAgent(BaseAgent):
                 ap=ap,
                 n_days=365,
                 sleep_sec=0.12,
-                out_filename="top100_ohlcv_last365.csv",
+                out_filename="price_ohlcv.csv",
                 min_required_hist=365,
             )
 
             summary["ohlcv_rows"] = len(ohlcv_df)
 
-            ohlcv_path = ap.file("ingest/price", "top100_ohlcv_last365.csv")
+            ohlcv_path = ap.file("ingest/price", "price_ohlcv.csv")
             summary["ohlcv_path"] = str(ohlcv_path)
             outputs.append(str(ohlcv_path))
 
@@ -1032,7 +1031,7 @@ class DataIngestionAgent(BaseAgent):
 
             summary["foreign_rows"] = len(foreign_df)
 
-            foreign_path = ap.file("ingest/price", "top100_foreign_snapshot_today.csv")
+            foreign_path = ap.file("ingest/price", "price_foreign.csv")
             summary["foreign_path"] = str(foreign_path)
             outputs.append(str(foreign_path))
 
