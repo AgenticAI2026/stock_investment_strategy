@@ -1,14 +1,4 @@
 from pathlib import Path
-import datetime as dt
-from zoneinfo import ZoneInfo
-
-
-def make_run_root(base_dir: str = "artifacts") -> Path:
-    run_id = dt.datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y%m%dT%H%M%S")
-    root = Path(base_dir) / f"run_id={run_id}"
-    root.mkdir(parents=True, exist_ok=True)
-    return root
-
 
 class ArtifactPaths:
 
@@ -48,8 +38,8 @@ class ArtifactPaths:
     def feature_table_dir(self) -> Path:
         return self.stage_dir("feature_table")
 
-    def prep_dir(self) -> Path:
-        return self.stage_dir("prep")
+    def prep_reco_dir(self) -> Path:
+        return self.stage_dir("prep_reco")
 
     def model_dir(self) -> Path:
         return self.stage_dir("model")
@@ -61,7 +51,7 @@ class ArtifactPaths:
         return self.stage_dir("report")
 
     # =================================================
-    # ✅ INGEST OUTPUTS (핵심)
+    # INGEST OUTPUTS
     # =================================================
 
     # --- PRICE (single file)
@@ -104,3 +94,49 @@ class ArtifactPaths:
 
     def feature_table(self) -> Path:
         return self.file("feature_table", "feature_table.csv")
+
+    # -------------------------------------------------
+    # Preprocessing
+    # -------------------------------------------------
+
+    def preprocessing_plan(self) -> Path:
+        return self.file("prep_reco", "preprocessing_plan.json")
+    
+    def data_contract(self) -> Path:
+        return self.file("prep_reco", "data_contract.json")
+
+    def preprocessing_report(self) -> Path:
+        return self.file("prep_reco", "preprocessing_report.md")
+
+
+    # -------------------------------------------------
+    # Model
+    # -------------------------------------------------
+
+    def model_selection_v1(self) -> Path:
+        return self.file("model", "model_selection_v1.json")
+
+    def model_selection_v2(self) -> Path:
+        return self.file("model", "model_selection_v2.json")
+
+
+    # -------------------------------------------------
+    # Inference
+    # -------------------------------------------------
+
+    def inference_signals(self) -> Path:
+        return self.file("inference", "signals.csv")
+
+
+    # -------------------------------------------------
+    # Report
+    # -------------------------------------------------
+
+    def report(self) -> Path:
+        return self.file("report", "report.md")
+
+    def validation_result(self) -> Path:
+        return self.file("report", "validation.json")
+
+    def shortform_script(self) -> Path:
+        return self.file("report", "shortform.txt")

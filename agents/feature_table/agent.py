@@ -1193,8 +1193,7 @@ class FeatureExtractionAgent:
         return str(out_path)
 
     def execute(self, ctx, ap):
-        ctx.logger.info("🚀 Feature Extraction Start")
-
+        
         feature_dir = ap.feature_table_dir()
 
         artifacts = {}
