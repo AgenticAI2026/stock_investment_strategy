@@ -1,0 +1,224 @@
+[
+  {
+    "model_id": "lstm_sequence",
+    "model_name": "LSTM",
+    "family": "deep_sequence",
+    "target_type": ["time_series"],
+
+    "data_requirements": {
+      "min_rows": 5000,
+      "supports_missing": false,
+      "stationary_required": false,
+      "scaling_required": true,
+      "multivariate_support": true
+    },
+
+    "feature_preferences": {
+      "temporal_dependency": true,
+      "nonlinear": true,
+      "seasonality": true,
+      "regime_shift_tolerance": "medium"
+    },
+
+    "applicability_signals": {
+      "n_rows_range": [5000, 100000000],
+      "sequence_length_range": [20, 512],
+      "autocorr_strength_min": 0.45,
+      "nonlinearity_score_min": 0.55,
+      "regime_change_score_min": 0.15,
+      "seasonality_strength_min": 0.15,
+      "missing_rate_max": 0.0,
+      "horizon_steps_range": [1, 120]
+    },
+
+    "exclusion_rules": [
+      { "if": { "gpu_available": false }, "then": "exclude_or_deprioritize" },
+      { "if": { "sequence_length_lt": 10 }, "then": "exclude" },
+      { "if": { "n_rows_lt": 5000 }, "then": "exclude" },
+      { "if": { "missing_rate_gt": 0.0 }, "then": "exclude_or_require_imputation" }
+    ],
+
+    "preprocessing_dependencies": {
+      "required": ["time_sort", "scaling", "sequence_windowing"],
+      "optional": ["time_features", "target_normalization", "masking_for_missing"],
+      "forbidden": ["random_split", "global_shuffle"]
+    },
+
+    "interpretability": {
+      "level": "low",
+      "explainable_methods": ["attention_rollout_if_available", "feature_ablation"]
+    },
+
+    "operational": {
+      "training_speed": "slow",
+      "inference_latency": "medium",
+      "gpu_required": true
+    }
+  },
+
+  {
+    "model_id": "gru_sequence",
+    "model_name": "GRU",
+    "family": "deep_sequence",
+    "target_type": ["time_series"],
+
+    "data_requirements": {
+      "min_rows": 4000,
+      "supports_missing": false,
+      "stationary_required": false,
+      "scaling_required": true,
+      "multivariate_support": true
+    },
+
+    "feature_preferences": {
+      "temporal_dependency": true,
+      "nonlinear": true,
+      "seasonality": true,
+      "regime_shift_tolerance": "medium"
+    },
+
+    "applicability_signals": {
+      "n_rows_range": [4000, 100000000],
+      "sequence_length_range": [20, 512],
+      "autocorr_strength_min": 0.40,
+      "nonlinearity_score_min": 0.55,
+      "regime_change_score_min": 0.15,
+      "seasonality_strength_min": 0.15,
+      "missing_rate_max": 0.0,
+      "horizon_steps_range": [1, 120]
+    },
+
+    "exclusion_rules": [
+      { "if": { "gpu_available": false }, "then": "exclude_or_deprioritize" },
+      { "if": { "n_rows_lt": 4000 }, "then": "exclude" },
+      { "if": { "missing_rate_gt": 0.0 }, "then": "exclude_or_require_imputation" }
+    ],
+
+    "preprocessing_dependencies": {
+      "required": ["time_sort", "scaling", "sequence_windowing"],
+      "optional": ["time_features", "target_normalization"],
+      "forbidden": ["random_split", "global_shuffle"]
+    },
+
+    "interpretability": {
+      "level": "low",
+      "explainable_methods": ["feature_ablation"]
+    },
+
+    "operational": {
+      "training_speed": "slow",
+      "inference_latency": "medium",
+      "gpu_required": true
+    }
+  },
+
+  {
+    "model_id": "tcn_sequence",
+    "model_name": "Temporal Convolutional Network",
+    "family": "deep_temporal_convolution",
+    "target_type": ["time_series"],
+
+    "data_requirements": {
+      "min_rows": 4000,
+      "supports_missing": false,
+      "stationary_required": false,
+      "scaling_required": true,
+      "multivariate_support": true
+    },
+
+    "feature_preferences": {
+      "temporal_dependency": true,
+      "nonlinear": true,
+      "seasonality": true,
+      "regime_shift_tolerance": "high"
+    },
+
+    "applicability_signals": {
+      "n_rows_range": [4000, 100000000],
+      "sequence_length_range": [24, 1024],
+      "autocorr_strength_min": 0.35,
+      "nonlinearity_score_min": 0.55,
+      "regime_change_score_min": 0.20,
+      "changepoint_density_min": 0.01,
+      "missing_rate_max": 0.0,
+      "horizon_steps_range": [1, 180]
+    },
+
+    "exclusion_rules": [
+      { "if": { "gpu_available": false }, "then": "exclude_or_deprioritize" },
+      { "if": { "n_rows_lt": 4000 }, "then": "exclude" },
+      { "if": { "missing_rate_gt": 0.0 }, "then": "exclude_or_require_imputation" }
+    ],
+
+    "preprocessing_dependencies": {
+      "required": ["time_sort", "scaling", "sequence_windowing"],
+      "optional": ["dilated_window_tuning", "time_features"],
+      "forbidden": ["random_split", "global_shuffle"]
+    },
+
+    "interpretability": {
+      "level": "low",
+      "explainable_methods": ["feature_ablation"]
+    },
+
+    "operational": {
+      "training_speed": "medium",
+      "inference_latency": "medium",
+      "gpu_required": true
+    }
+  },
+
+  {
+    "model_id": "nbeats",
+    "model_name": "N-BEATS",
+    "family": "deep_forecasting_architecture",
+    "target_type": ["time_series"],
+
+    "data_requirements": {
+      "min_rows": 3000,
+      "supports_missing": false,
+      "stationary_required": false,
+      "scaling_required": true,
+      "multivariate_support": false
+    },
+
+    "feature_preferences": {
+      "temporal_dependency": true,
+      "nonlinear": true,
+      "seasonality": true,
+      "regime_shift_tolerance": "medium"
+    },
+
+    "applicability_signals": {
+      "n_rows_range": [3000, 100000000],
+      "trend_strength_min": 0.20,
+      "seasonality_strength_min": 0.15,
+      "nonlinearity_score_min": 0.50,
+      "missing_rate_max": 0.0,
+      "horizon_steps_range": [1, 180]
+    },
+
+    "exclusion_rules": [
+      { "if": { "gpu_available": false }, "then": "exclude_or_deprioritize" },
+      { "if": { "n_rows_lt": 3000 }, "then": "exclude" },
+      { "if": { "missing_rate_gt": 0.0 }, "then": "exclude_or_require_imputation" }
+    ],
+
+    "preprocessing_dependencies": {
+      "required": ["time_sort", "scaling", "sequence_windowing"],
+      "optional": ["trend_seasonality_decomposition_hint"],
+      "forbidden": ["random_split", "global_shuffle"]
+    },
+
+    "interpretability": {
+      "level": "low",
+      "explainable_methods": ["block_decomposition_if_available"]
+    },
+
+    "operational": {
+      "training_speed": "slow",
+      "inference_latency": "medium",
+      "gpu_required": true
+    }
+  }
+]

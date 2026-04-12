@@ -1,0 +1,160 @@
+[
+  {
+    "model_id": "xgboost_lag",
+    "model_name": "XGBoost with Lag/Rolling Features",
+    "family": "tree_boosting_time_series",
+    "target_type": ["time_series"],
+
+    "data_requirements": {
+      "min_rows": 500,
+      "supports_missing": true,
+      "stationary_required": false,
+      "scaling_required": false,
+      "multivariate_support": true
+    },
+
+    "feature_preferences": {
+      "temporal_dependency": true,
+      "nonlinear": true,
+      "seasonality": true,
+      "regime_shift_tolerance": "high"
+    },
+
+    "applicability_signals": {
+      "n_rows_range": [500, 5000000],
+      "nonlinearity_score_min": 0.45,
+      "feature_interaction_score_min": 0.40,
+      "regime_change_score_min": 0.15,
+      "changepoint_density_min": 0.01,
+      "missing_rate_max": 0.45,
+      "horizon_steps_range": [1, 120]
+    },
+
+    "exclusion_rules": [
+      { "if": { "n_rows_lt": 500 }, "then": "exclude" }
+    ],
+
+    "preprocessing_dependencies": {
+      "required": ["time_sort", "lag_features", "rolling_features"],
+      "optional": ["calendar_features", "target_encoding_for_regressors", "early_stopping"],
+      "forbidden": ["random_split", "global_shuffle"]
+    },
+
+    "interpretability": {
+      "level": "medium",
+      "explainable_methods": ["feature_importance", "SHAP"]
+    },
+
+    "operational": {
+      "training_speed": "medium",
+      "inference_latency": "medium",
+      "gpu_required": false
+    }
+  },
+
+  {
+    "model_id": "lightgbm_lag",
+    "model_name": "LightGBM with Lag/Rolling Features",
+    "family": "tree_boosting_time_series",
+    "target_type": ["time_series"],
+
+    "data_requirements": {
+      "min_rows": 500,
+      "supports_missing": true,
+      "stationary_required": false,
+      "scaling_required": false,
+      "multivariate_support": true
+    },
+
+    "feature_preferences": {
+      "temporal_dependency": true,
+      "nonlinear": true,
+      "seasonality": true,
+      "regime_shift_tolerance": "high"
+    },
+
+    "applicability_signals": {
+      "n_rows_range": [500, 8000000],
+      "nonlinearity_score_min": 0.45,
+      "feature_interaction_score_min": 0.40,
+      "regime_change_score_min": 0.15,
+      "changepoint_density_min": 0.01,
+      "missing_rate_max": 0.50,
+      "horizon_steps_range": [1, 120]
+    },
+
+    "exclusion_rules": [
+      { "if": { "n_rows_lt": 500 }, "then": "exclude" }
+    ],
+
+    "preprocessing_dependencies": {
+      "required": ["time_sort", "lag_features", "rolling_features"],
+      "optional": ["calendar_features", "categorical_event_features"],
+      "forbidden": ["random_split", "global_shuffle"]
+    },
+
+    "interpretability": {
+      "level": "medium",
+      "explainable_methods": ["feature_importance", "SHAP"]
+    },
+
+    "operational": {
+      "training_speed": "fast",
+      "inference_latency": "low",
+      "gpu_required": false
+    }
+  },
+
+  {
+    "model_id": "random_forest_lag",
+    "model_name": "Random Forest with Lag/Rolling Features",
+    "family": "tree_ensemble_time_series",
+    "target_type": ["time_series"],
+
+    "data_requirements": {
+      "min_rows": 700,
+      "supports_missing": true,
+      "stationary_required": false,
+      "scaling_required": false,
+      "multivariate_support": true
+    },
+
+    "feature_preferences": {
+      "temporal_dependency": true,
+      "nonlinear": true,
+      "seasonality": false,
+      "regime_shift_tolerance": "medium"
+    },
+
+    "applicability_signals": {
+      "n_rows_range": [700, 1000000],
+      "nonlinearity_score_min": 0.35,
+      "feature_interaction_score_min": 0.35,
+      "regime_change_score_min": 0.10,
+      "missing_rate_max": 0.35,
+      "horizon_steps_range": [1, 90]
+    },
+
+    "exclusion_rules": [
+      { "if": { "n_rows_lt": 700 }, "then": "exclude" },
+      { "if": { "n_features_gt": 50000 }, "then": "deprioritize" }
+    ],
+
+    "preprocessing_dependencies": {
+      "required": ["time_sort", "lag_features", "rolling_features"],
+      "optional": ["calendar_features", "feature_selection"],
+      "forbidden": ["random_split", "global_shuffle"]
+    },
+
+    "interpretability": {
+      "level": "medium",
+      "explainable_methods": ["feature_importance", "permutation_importance"]
+    },
+
+    "operational": {
+      "training_speed": "medium",
+      "inference_latency": "medium",
+      "gpu_required": false
+    }
+  }
+]

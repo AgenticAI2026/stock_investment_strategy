@@ -140,6 +140,8 @@ class PreprocessingRecommenderAgent(BaseAgent):
         self.feature_sets: Dict[str, Dict[str, List[str]]] = {}
         self.leakage_findings: Dict[str, List[Dict[str, Any]]] = {}
 
+        self.time_series_diagnostics: Dict[str, Dict[str, Any]] = {}
+
 
     # ---------------------------
     # Pipeline Entry
@@ -872,6 +874,9 @@ class PreprocessingRecommenderAgent(BaseAgent):
             leaks = self._detect_leakage(df, roles, spec)
             self.leakage_findings[key] = leaks
 
+            ts_diag = self._profile_time_series_diagnostics(spec, df, roles, fsets)
+            self.time_series_diagnostics[key] = ts_diag
+            
     def _profile_table(self, df: pd.DataFrame, roles: Dict[str, Any], fsets: Dict[str, List[str]]) -> Dict[str, Any]:
         out: Dict[str, Any] = {}
         out["n_rows"] = int(len(df))
@@ -938,6 +943,257 @@ class PreprocessingRecommenderAgent(BaseAgent):
         out["datetime_hints"] = dt_hints
 
         return out
+    
+    def _profile_time_series_diagnostics(
+        self,
+        spec: TableSpec,
+        df: pd.DataFrame,
+        roles: Dict[str, Any],
+        fsets: Dict[str, List[str]],
+    ) -> Dict[str, Any]:
+        time_col = roles.get("time_col")
+        entity_key = []
+        ticker_col = roles.get("ticker_col")
+        if ticker_col:
+            entity_key.append(ticker_col)
+        for c in roles.get("id_cols", []) or []:
+            if c not in entity_key:
+                entity_key.append(c)
+
+        if not spec.temporal or not time_col or time_col not in df.columns:
+            return {
+                "enabled": False,
+                "reason": "table_is_not_temporal_or_time_col_missing"
+            }
+
+        work = df.copy()
+
+        parsed_time = pd.to_datetime(work[time_col], errors="coerce", utc=False)
+        valid_mask = parsed_time.notna()
+        work = work.loc[valid_mask].copy()
+        work[time_col] = parsed_time.loc[valid_mask]
+
+        if len(work) < 30:
+            return {
+                "enabled": False,
+                "reason": "insufficient_valid_time_rows",
+                "time_col": time_col
+            }
+
+        proxy_col = self._choose_proxy_target_col(work, fsets)
+        if proxy_col is None:
+            return {
+                "enabled": False,
+                "reason": "no_numeric_proxy_column_found",
+                "time_col": time_col,
+                "entity_key": entity_key,
+            }
+
+        grouped_series = self._extract_groupwise_series(work, time_col, entity_key, proxy_col)
+
+        if len(grouped_series) == 0:
+            return {
+                "enabled": False,
+                "reason": "no_valid_groupwise_series",
+                "time_col": time_col,
+                "entity_key": entity_key,
+                "proxy_target_col": proxy_col,
+            }
+
+        metrics = {
+            "autocorr_lag1": [],
+            "autocorr_lag5": [],
+            "seasonality_strength": [],
+            "trend_strength": [],
+            "regime_change_score": [],
+            "changepoint_density": [],
+            "volatility_clustering": [],
+            "nonstationarity_score": [],
+            "series_lengths": [],
+            "cross_sectional_std": [],
+        }
+
+        for s in grouped_series:
+            vals = pd.to_numeric(s, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+            if len(vals) < 30:
+                continue
+
+            arr = vals.to_numpy(dtype=float)
+            metrics["series_lengths"].append(len(arr))
+            metrics["autocorr_lag1"].append(self._safe_autocorr(arr, 1))
+            metrics["autocorr_lag5"].append(self._safe_autocorr(arr, 5))
+            metrics["seasonality_strength"].append(self._seasonality_strength(arr))
+            metrics["trend_strength"].append(self._trend_strength(arr))
+            metrics["regime_change_score"].append(self._regime_change_score(arr))
+            metrics["changepoint_density"].append(self._changepoint_density(arr))
+            metrics["volatility_clustering"].append(self._volatility_clustering(arr))
+            metrics["nonstationarity_score"].append(self._nonstationarity_score(arr))
+
+        # cross-sectional dispersion: 같은 시점에 entity 간 분산 정도
+        if entity_key:
+            try:
+                tmp = work[[time_col] + entity_key + [proxy_col]].copy()
+                tmp[proxy_col] = pd.to_numeric(tmp[proxy_col], errors="coerce")
+                tmp = tmp.dropna(subset=[proxy_col])
+                cs = tmp.groupby(time_col)[proxy_col].std().dropna()
+                if len(cs) > 0:
+                    metrics["cross_sectional_std"] = cs.tolist()
+            except Exception:
+                pass
+
+        valid_lengths = metrics["series_lengths"]
+        if len(valid_lengths) == 0:
+            return {
+                "enabled": False,
+                "reason": "no_series_long_enough_for_diagnostics",
+                "time_col": time_col,
+                "entity_key": entity_key,
+                "proxy_target_col": proxy_col,
+            }
+
+        return {
+            "enabled": True,
+            "time_col": time_col,
+            "entity_key": entity_key,
+            "proxy_target_col": proxy_col,
+            "n_entities": int(len(grouped_series)),
+            "median_points_per_entity": int(np.median(valid_lengths)),
+            "autocorr_lag1": self._robust_mean(metrics["autocorr_lag1"]),
+            "autocorr_lag5": self._robust_mean(metrics["autocorr_lag5"]),
+            "seasonality_strength": self._robust_mean(metrics["seasonality_strength"]),
+            "trend_strength": self._robust_mean(metrics["trend_strength"]),
+            "regime_change_score": self._robust_mean(metrics["regime_change_score"]),
+            "changepoint_density": self._robust_mean(metrics["changepoint_density"]),
+            "volatility_clustering": self._robust_mean(metrics["volatility_clustering"]),
+            "nonstationarity_score": self._robust_mean(metrics["nonstationarity_score"]),
+            "cross_sectional_dispersion": self._robust_mean(metrics["cross_sectional_std"]),
+        }
+
+    def _choose_proxy_target_col(self, df: pd.DataFrame, fsets: Dict[str, List[str]]) -> Optional[str]:
+        preferred = [
+            "close", "종가", "y", "target",
+            "daily_return", "log_return",
+            "revenue_yoy", "operating_income_yoy",
+            "recent_news_ratio"
+        ]
+        num_cols = fsets.get("numeric", []) or []
+
+        for cand in preferred:
+            if cand in df.columns and cand in num_cols:
+                return cand
+
+        for c in num_cols:
+            cl = str(c).lower()
+            if any(k in cl for k in ["close", "price", "return", "ret", "revenue", "income", "score", "ratio"]):
+                return c
+
+        return num_cols[0] if num_cols else None
+
+    def _extract_groupwise_series(
+        self,
+        df: pd.DataFrame,
+        time_col: str,
+        entity_key: List[str],
+        value_col: str,
+    ) -> List[pd.Series]:
+        out = []
+
+        if entity_key:
+            g = df.groupby(entity_key, dropna=False)
+            for _, sub in g:
+                sub = sub.sort_values(time_col)
+                s = pd.to_numeric(sub[value_col], errors="coerce").dropna()
+                if len(s) >= 30:
+                    out.append(s.reset_index(drop=True))
+        else:
+            sub = df.sort_values(time_col)
+            s = pd.to_numeric(sub[value_col], errors="coerce").dropna()
+            if len(s) >= 30:
+                out.append(s.reset_index(drop=True))
+
+        return out
+
+    def _safe_autocorr(self, arr: np.ndarray, lag: int) -> float:
+        if len(arr) <= lag + 5:
+            return 0.0
+        x = arr[:-lag]
+        y = arr[lag:]
+        if np.std(x) < 1e-12 or np.std(y) < 1e-12:
+            return 0.0
+        return float(np.clip(np.corrcoef(x, y)[0, 1], -1.0, 1.0))
+
+    def _seasonality_strength(self, arr: np.ndarray) -> float:
+        candidates = [5, 20, 60]
+        vals = []
+        for lag in candidates:
+            if len(arr) > lag + 10:
+                vals.append(abs(self._safe_autocorr(arr, lag)))
+        return float(np.clip(np.max(vals) if vals else 0.0, 0.0, 1.0))
+
+    def _trend_strength(self, arr: np.ndarray) -> float:
+        if len(arr) < 20:
+            return 0.0
+        x = np.arange(len(arr), dtype=float)
+        y = arr.astype(float)
+        if np.std(y) < 1e-12:
+            return 0.0
+        corr = np.corrcoef(x, y)[0, 1]
+        return float(np.clip(abs(corr), 0.0, 1.0))
+
+    def _regime_change_score(self, arr: np.ndarray) -> float:
+        if len(arr) < 40:
+            return 0.0
+        w = max(10, len(arr) // 8)
+        s = pd.Series(arr)
+        rm = s.rolling(w).mean().dropna()
+        if len(rm) < 5:
+            return 0.0
+        diffs = rm.diff().abs().dropna()
+        base = float(np.nanstd(arr)) + 1e-9
+        score = float(diffs.mean() / base)
+        return float(np.clip(score, 0.0, 1.0))
+
+    def _changepoint_density(self, arr: np.ndarray) -> float:
+        if len(arr) < 40:
+            return 0.0
+        s = pd.Series(arr)
+        w = max(10, len(arr) // 8)
+        rm = s.rolling(w).mean().dropna()
+        if len(rm) < 5:
+            return 0.0
+        diffs = rm.diff().abs().dropna()
+        thr = diffs.mean() + 2.0 * diffs.std()
+        if np.isnan(thr):
+            return 0.0
+        cp = int((diffs > thr).sum())
+        return float(np.clip(cp / max(len(arr), 1), 0.0, 1.0))
+
+    def _volatility_clustering(self, arr: np.ndarray) -> float:
+        if len(arr) < 40:
+            return 0.0
+        ret = np.diff(arr)
+        if len(ret) < 20:
+            return 0.0
+        abs_ret = np.abs(ret)
+        return float(np.clip(abs(self._safe_autocorr(abs_ret, 1)), 0.0, 1.0))
+
+    def _nonstationarity_score(self, arr: np.ndarray) -> float:
+        if len(arr) < 40:
+            return 0.0
+
+        first = arr[: len(arr) // 2]
+        second = arr[len(arr) // 2 :]
+
+        mean_shift = abs(np.mean(first) - np.mean(second)) / (np.std(arr) + 1e-9)
+        std_shift = abs(np.std(first) - np.std(second)) / (np.std(arr) + 1e-9)
+        score = 0.6 * mean_shift + 0.4 * std_shift
+        return float(np.clip(score, 0.0, 1.0))
+
+    def _robust_mean(self, xs: List[float]) -> float:
+        vals = [float(x) for x in xs if x is not None and not np.isnan(x)]
+        if len(vals) == 0:
+            return 0.0
+        return float(np.median(vals))
 
     def _datetime_hint(self, s: pd.Series) -> Optional[Dict[str, Any]]:
         if pd.api.types.is_datetime64_any_dtype(s):
@@ -958,6 +1214,63 @@ class PreprocessingRecommenderAgent(BaseAgent):
             return {"detected": "string_date", "parse_needed": True, "format_hint": "YYYY-MM-DD"}
         return None
 
+    def _time_series_preprocessing_recommendations(
+        self,
+        spec: TableSpec,
+        roles: Dict[str, Any],
+        ts_diag: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        if not ts_diag.get("enabled", False):
+            return {
+                "enabled": False,
+                "reason": ts_diag.get("reason", "not_applicable")
+            }
+
+        required = ["sort_by_time", "groupwise_processing", "time_based_split"]
+        recommended = []
+        optional = []
+        avoid = ["random_split", "global_shuffle", "forward_fill_across_split"]
+        notes = []
+
+        if roles.get("time_col"):
+            required.append("time_col_parse_and_validate")
+
+        if ts_diag.get("autocorr_lag1", 0.0) >= 0.3:
+            recommended.append("lag_features")
+            notes.append("autocorr_lag1가 높아 lag feature 활용 권장")
+
+        if ts_diag.get("trend_strength", 0.0) >= 0.4:
+            recommended.append("difference_or_return_transform")
+            notes.append("trend_strength가 높아 차분 또는 수익률 변환 검토")
+
+        if ts_diag.get("seasonality_strength", 0.0) >= 0.35:
+            recommended.append("seasonal_lag_features")
+            optional.append("fourier_terms")
+            notes.append("seasonality_strength가 높아 seasonal lag / Fourier term 검토")
+
+        if ts_diag.get("volatility_clustering", 0.0) >= 0.35:
+            recommended.append("rolling_volatility_features")
+            optional.append("rolling_normalization")
+            notes.append("volatility clustering이 있어 rolling volatility 계열 feature 권장")
+
+        if ts_diag.get("regime_change_score", 0.0) >= 0.3 or ts_diag.get("changepoint_density", 0.0) >= 0.03:
+            optional.append("changepoint_aware_model")
+            optional.append("regime_indicator_features")
+            notes.append("regime 변화가 감지되어 changepoint/regime-aware 접근 검토")
+
+        if ts_diag.get("nonstationarity_score", 0.0) >= 0.4:
+            recommended.append("stationarity_adjustment")
+            notes.append("비정상성이 높아 차분, detrending, rolling normalization 검토")
+
+        return {
+            "enabled": True,
+            "required": self._dedup_keep_order(required),
+            "recommended": self._dedup_keep_order(recommended),
+            "optional": self._dedup_keep_order(optional),
+            "avoid": self._dedup_keep_order(avoid),
+            "notes": notes,
+        }
+    
     # ---------------------------
     # Leakage detection
     # ---------------------------
@@ -1134,6 +1447,8 @@ class PreprocessingRecommenderAgent(BaseAgent):
         leaks: List[Dict[str, Any]],
         split_strategy: str,
     ) -> Dict[str, Any]:
+        ts_diag = self.time_series_diagnostics.get(f"{spec.domain}.{spec.name}", {})
+
         missing_map = {d["col"]: d["missing_rate"] for d in (prof.get("missing_top") or [])}
         high_missing = [c for c, r in missing_map.items() if r >= 0.5]
         mid_missing = [c for c, r in missing_map.items() if 0.1 <= r < 0.5]
@@ -1209,6 +1524,12 @@ class PreprocessingRecommenderAgent(BaseAgent):
                 "time_col_present": time_col_present,
                 "time_alignment_risk": time_alignment_risk
             },
+            "time_series_diagnostics": ts_diag,
+            "time_series_preprocessing_recommendations": self._time_series_preprocessing_recommendations(
+                spec=spec,
+                roles=roles,
+                ts_diag=ts_diag,
+            ),
             "join_keys": join_key_reqs,
             "raw_text_reference": raw_text_reqs,
             "leakage": {
@@ -1532,20 +1853,70 @@ class PreprocessingRecommenderAgent(BaseAgent):
             lines.append(f"### {key}")
             lines.append(f"- rows: {prof.get('n_rows')}, cols: {prof.get('n_cols')}\n")
 
-            dreq = (plan.get("tables", {}).get(key, {}) or {}).get("dictionary_requirements", {})
+            table_plan = (plan.get("tables", {}).get(key, {}) or {})
+            dreq = table_plan.get("dictionary_requirements", {}) or {}
+            reqs = table_plan.get("requirements", {}) or {}
+
+            # Dictionary coverage
             cov = (dreq.get("dictionary_coverage", {}) or {})
             if cov:
                 f = cov.get("feature_dict", {}) or {}
                 c = cov.get("column_dict", {}) or {}
                 lines.append("**Dictionary coverage**")
                 if f:
-                    lines.append(f"- feature_dict present: {f.get('n_features_present_in_table_and_dictionary')} / {f.get('n_features_in_dictionary')}")
+                    lines.append(
+                        f"- feature_dict present: "
+                        f"{f.get('n_features_present_in_table_and_dictionary')} / {f.get('n_features_in_dictionary')}"
+                    )
                 if c:
-                    lines.append(f"- column_dict present: {c.get('n_columns_present_in_table_and_dictionary')} / {c.get('n_columns_in_dictionary')}")
+                    lines.append(
+                        f"- column_dict present: "
+                        f"{c.get('n_columns_present_in_table_and_dictionary')} / {c.get('n_columns_in_dictionary')}"
+                    )
+                lines.append("")
+
+            # Time-series diagnostics
+            ts_diag = reqs.get("time_series_diagnostics", {}) or {}
+            ts_reco = reqs.get("time_series_preprocessing_recommendations", {}) or {}
+
+            if ts_diag.get("enabled"):
+                lines.append("**Time-series diagnostics**")
+                lines.append(f"- time_col: {ts_diag.get('time_col')}")
+                lines.append(f"- proxy_target_col: {ts_diag.get('proxy_target_col')}")
+                lines.append(f"- n_entities: {ts_diag.get('n_entities')}")
+                lines.append(f"- median_points_per_entity: {ts_diag.get('median_points_per_entity')}")
+                lines.append(f"- autocorr_lag1: {ts_diag.get('autocorr_lag1', 0.0):.3f}")
+                lines.append(f"- autocorr_lag5: {ts_diag.get('autocorr_lag5', 0.0):.3f}")
+                lines.append(f"- seasonality_strength: {ts_diag.get('seasonality_strength', 0.0):.3f}")
+                lines.append(f"- trend_strength: {ts_diag.get('trend_strength', 0.0):.3f}")
+                lines.append(f"- regime_change_score: {ts_diag.get('regime_change_score', 0.0):.3f}")
+                lines.append(f"- changepoint_density: {ts_diag.get('changepoint_density', 0.0):.3f}")
+                lines.append(f"- volatility_clustering: {ts_diag.get('volatility_clustering', 0.0):.3f}")
+                lines.append(f"- nonstationarity_score: {ts_diag.get('nonstationarity_score', 0.0):.3f}")
+                lines.append(f"- cross_sectional_dispersion: {ts_diag.get('cross_sectional_dispersion', 0.0):.3f}")
+                lines.append("")
+
+                lines.append("**Time-series preprocessing recommendations**")
+                for bucket in ["required", "recommended", "optional", "avoid"]:
+                    vals = ts_reco.get(bucket, []) or []
+                    if vals:
+                        lines.append(f"- {bucket}: {', '.join(vals)}")
+
+                notes = ts_reco.get("notes", []) or []
+                if notes:
+                    lines.append("- notes:")
+                    for note in notes:
+                        lines.append(f"  - {note}")
+                lines.append("")
+
+            elif "time_series_diagnostics" in reqs:
+                lines.append("**Time-series diagnostics**")
+                lines.append(f"- enabled: False")
+                lines.append(f"- reason: {ts_diag.get('reason', 'not_applicable')}")
                 lines.append("")
 
         return "\n".join(lines)
-
+        
     # ---------------------------
     # Helpers
     # ---------------------------

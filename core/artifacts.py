@@ -1,5 +1,6 @@
 from pathlib import Path
 
+
 class ArtifactPaths:
 
     def __init__(self, root: Path):
@@ -21,12 +22,10 @@ class ArtifactPaths:
         return path
 
     def file(self, stage: str, filename: str) -> Path:
-        path = self.stage_dir(stage)
-        return path / filename
+        return self.stage_dir(stage) / filename
 
     def file_in(self, stage: str, sub: str, filename: str) -> Path:
-        path = self.sub_dir(stage, sub)
-        return path / filename
+        return self.sub_dir(stage, sub) / filename
 
     # -------------------------------------------------
     # Stage dirs
@@ -54,64 +53,104 @@ class ArtifactPaths:
     # INGEST OUTPUTS
     # =================================================
 
-    # --- PRICE (single file)
+    # --- PRICE
     def price_ohlcv(self) -> Path:
         return self.file_in("ingest", "price", "price_ohlcv.csv")
 
     def price_foreign(self) -> Path:
         return self.file_in("ingest", "price", "price_foreign.csv")
 
-    # --- USER (single file)
+    def ingest_price_dir(self) -> Path:
+        return self.sub_dir("ingest", "price")
+
+    # --- USER
     def user_profile(self) -> Path:
         return self.file_in("ingest", "user", "user_profile.csv")
 
     def user_event_log(self) -> Path:
         return self.file_in("ingest", "user", "user_event_log.csv")
 
-    # --- FINANCE (multi file dir)
-    def finance_dir(self) -> Path:
+    def ingest_user_dir(self) -> Path:
+        return self.sub_dir("ingest", "user")
+
+    # --- FINANCE
+    def ingest_finance_dir(self) -> Path:
         return self.sub_dir("ingest", "finance")
 
-    # --- NEWS (multi file dir)
-    def news_dir(self) -> Path:
+    # --- NEWS
+    def ingest_news_dir(self) -> Path:
         return self.sub_dir("ingest", "news")
 
     # =================================================
-    # FEATURE OUTPUTS
+    # FEATURE TABLE OUTPUTS
     # =================================================
 
-    def price_features(self) -> Path:
-        return self.file_in("feature_table", "price", "price_features.csv")
-
-    def finance_features_dir(self) -> Path:
-        return self.sub_dir("feature_table", "finance")
-
-    def news_features(self) -> Path:
-        return self.file_in("feature_table", "news", "news_features.csv")
+    # --- USER
+    def feature_user_dir(self) -> Path:
+        return self.sub_dir("feature_table", "user")
 
     def user_features(self) -> Path:
         return self.file_in("feature_table", "user", "user_features.csv")
 
-    def feature_table(self) -> Path:
-        return self.file("feature_table", "feature_table.csv")
+    def user_feature_dictionary(self) -> Path:
+        return self.file_in("feature_table", "user", "user_feature_dictionary.csv")
 
-    # -------------------------------------------------
-    # Preprocessing
-    # -------------------------------------------------
+    # --- PRICE
+    def feature_price_dir(self) -> Path:
+        return self.sub_dir("feature_table", "price")
+
+    def price_ohlcv_features(self) -> Path:
+        return self.file_in("feature_table", "price", "price_ohlcv_features.csv")
+
+    def price_foreign_features(self) -> Path:
+        return self.file_in("feature_table", "price", "price_foreign_features.csv")
+
+    def price_feature_dictionary(self) -> Path:
+        return self.file_in("feature_table", "price", "price_feature_dictionary.csv")
+
+    # --- FINANCE
+    def feature_finance_dir(self) -> Path:
+        return self.sub_dir("feature_table", "finance")
+
+    # finance는 종목별 여러 파일이므로 directory 위주
+    def finance_feature_dictionary(self) -> Path:
+        return self.file_in("feature_table", "finance", "finance_feature_dictionary.csv")
+
+    # --- NEWS
+    def feature_news_dir(self) -> Path:
+        return self.sub_dir("feature_table", "news")
+
+    def news_features(self) -> Path:
+        return self.file_in("feature_table", "news", "news_features.csv")
+
+    def news_raw(self) -> Path:
+        return self.file_in("feature_table", "news", "news_raw.csv")
+
+    def news_feature_dictionary(self) -> Path:
+        return self.file_in("feature_table", "news", "news_feature_dictionary.csv")
+
+    def news_raw_dictionary(self) -> Path:
+        return self.file_in("feature_table", "news", "news_raw_dictionary.csv")
+
+    # =================================================
+    # PREPROCESSING
+    # =================================================
 
     def preprocessing_plan(self) -> Path:
         return self.file("prep_reco", "preprocessing_plan.json")
-    
+
     def data_contract(self) -> Path:
         return self.file("prep_reco", "data_contract.json")
 
     def preprocessing_report(self) -> Path:
         return self.file("prep_reco", "preprocessing_report.md")
 
+    # =================================================
+    # MODEL
+    # =================================================
 
-    # -------------------------------------------------
-    # Model
-    # -------------------------------------------------
+    def model_matching_result(self) -> Path:
+        return self.file("model", "model_matching_result.json")
 
     def model_selection_v1(self) -> Path:
         return self.file("model", "model_selection_v1.json")
@@ -119,18 +158,16 @@ class ArtifactPaths:
     def model_selection_v2(self) -> Path:
         return self.file("model", "model_selection_v2.json")
 
-
-    # -------------------------------------------------
-    # Inference
-    # -------------------------------------------------
+    # =================================================
+    # INFERENCE
+    # =================================================
 
     def inference_signals(self) -> Path:
         return self.file("inference", "signals.csv")
 
-
-    # -------------------------------------------------
-    # Report
-    # -------------------------------------------------
+    # =================================================
+    # REPORT
+    # =================================================
 
     def report(self) -> Path:
         return self.file("report", "report.md")
