@@ -10,6 +10,7 @@ from core.artifacts import ArtifactPaths
 from agents.ingest.agent import DataIngestionAgent
 from agents.feature_table.agent import FeatureExtractionAgent
 from agents.prep_reco.agent import PreprocessingRecommenderAgent
+from agents.model_match_v1.agent import ModelDataMatcherAgent
 
 
 class PipelineState(TypedDict, total=False):
@@ -76,7 +77,6 @@ def run_ingest(state: PipelineState) -> PipelineState:
     )
     return _run_stage(state, "ingest", agent)
 
-
 def run_feature_table(state: PipelineState) -> PipelineState:
     agent = FeatureExtractionAgent()
     return _run_stage(state, "feature_table", agent)
@@ -86,6 +86,10 @@ def run_prep_reco(state: PipelineState) -> PipelineState:
     agent = PreprocessingRecommenderAgent()
     return _run_stage(state, "prep_reco", agent)
 
+def run_model_match_v1(state: PipelineState) -> PipelineState:
+    agent = ModelDataMatcherAgent()
+    return _run_stage(state, "model_match_v1", agent)
+
 
 def build_pipeline():
     graph = StateGraph(PipelineState)
@@ -93,10 +97,12 @@ def build_pipeline():
     graph.add_node("ingest", run_ingest)
     graph.add_node("feature_table", run_feature_table)
     graph.add_node("prep_reco", run_prep_reco)
+    graph.add_node("model_match_v1", run_model_match_v1)
 
     graph.set_entry_point("ingest")
     graph.add_edge("ingest", "feature_table")
     graph.add_edge("feature_table", "prep_reco")
-    graph.add_edge("prep_reco", END)
+    graph.add_edge("prep_reco", "model_match_v1")
+    graph.add_edge("model_match_v1", END)
 
     return graph.compile()

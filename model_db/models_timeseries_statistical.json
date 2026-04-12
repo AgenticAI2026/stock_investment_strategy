@@ -1,0 +1,223 @@
+[
+  {
+    "model_id": "arima",
+    "model_name": "ARIMA",
+    "family": "statistical_time_series",
+    "target_type": ["time_series"],
+
+    "data_requirements": {
+      "min_rows": 100,
+      "supports_missing": false,
+      "stationary_required": true,
+      "scaling_required": false,
+      "multivariate_support": false
+    },
+
+    "feature_preferences": {
+      "temporal_dependency": true,
+      "nonlinear": false,
+      "seasonality": false,
+      "regime_shift_tolerance": "low"
+    },
+
+    "applicability_signals": {
+      "n_rows_range": [100, 20000],
+      "autocorr_strength_min": 0.45,
+      "seasonality_strength_max": 0.35,
+      "trend_strength_max": 0.55,
+      "regime_change_score_max": 0.30,
+      "changepoint_density_max": 0.03,
+      "nonstationarity_score_max": 0.45,
+      "missing_rate_max": 0.0,
+      "horizon_steps_range": [1, 30]
+    },
+
+    "exclusion_rules": [
+      { "if": { "n_rows_lt": 100 }, "then": "exclude" },
+      { "if": { "missing_rate_gt": 0.0 }, "then": "exclude_or_require_imputation" },
+      { "if": { "seasonality_strength_gt": 0.45 }, "then": "deprioritize" },
+      { "if": { "regime_change_score_gt": 0.4 }, "then": "deprioritize" }
+    ],
+
+    "preprocessing_dependencies": {
+      "required": ["time_sort", "stationarity_check"],
+      "optional": ["differencing", "log_transform", "outlier_review"],
+      "forbidden": ["random_split", "global_shuffle"]
+    },
+
+    "interpretability": {
+      "level": "high",
+      "explainable_methods": ["model_parameters", "acf_pacf"]
+    },
+
+    "operational": {
+      "training_speed": "fast",
+      "inference_latency": "low",
+      "gpu_required": false
+    }
+  },
+
+  {
+    "model_id": "sarima",
+    "model_name": "SARIMA",
+    "family": "seasonal_statistical_time_series",
+    "target_type": ["time_series"],
+
+    "data_requirements": {
+      "min_rows": 180,
+      "supports_missing": false,
+      "stationary_required": true,
+      "scaling_required": false,
+      "multivariate_support": false
+    },
+
+    "feature_preferences": {
+      "temporal_dependency": true,
+      "nonlinear": false,
+      "seasonality": true,
+      "regime_shift_tolerance": "low"
+    },
+
+    "applicability_signals": {
+      "n_rows_range": [180, 30000],
+      "autocorr_strength_min": 0.40,
+      "seasonality_strength_min": 0.35,
+      "regime_change_score_max": 0.35,
+      "changepoint_density_max": 0.04,
+      "nonstationarity_score_max": 0.50,
+      "missing_rate_max": 0.0,
+      "horizon_steps_range": [1, 60]
+    },
+
+    "exclusion_rules": [
+      { "if": { "n_rows_lt": 180 }, "then": "exclude" },
+      { "if": { "missing_rate_gt": 0.0 }, "then": "exclude_or_require_imputation" },
+      { "if": { "seasonality_strength_lt": 0.25 }, "then": "deprioritize" }
+    ],
+
+    "preprocessing_dependencies": {
+      "required": ["time_sort", "stationarity_check", "seasonality_check"],
+      "optional": ["seasonal_differencing", "log_transform"],
+      "forbidden": ["random_split", "global_shuffle"]
+    },
+
+    "interpretability": {
+      "level": "high",
+      "explainable_methods": ["seasonal_order", "acf_pacf"]
+    },
+
+    "operational": {
+      "training_speed": "medium",
+      "inference_latency": "low",
+      "gpu_required": false
+    }
+  },
+
+  {
+    "model_id": "ets",
+    "model_name": "ETS (Exponential Smoothing)",
+    "family": "trend_seasonality_decomposition",
+    "target_type": ["time_series"],
+
+    "data_requirements": {
+      "min_rows": 80,
+      "supports_missing": false,
+      "stationary_required": false,
+      "scaling_required": false,
+      "multivariate_support": false
+    },
+
+    "feature_preferences": {
+      "temporal_dependency": true,
+      "nonlinear": false,
+      "seasonality": true,
+      "regime_shift_tolerance": "low"
+    },
+
+    "applicability_signals": {
+      "n_rows_range": [80, 20000],
+      "trend_strength_min": 0.25,
+      "seasonality_strength_min": 0.20,
+      "regime_change_score_max": 0.30,
+      "changepoint_density_max": 0.03,
+      "missing_rate_max": 0.0,
+      "horizon_steps_range": [1, 90]
+    },
+
+    "exclusion_rules": [
+      { "if": { "n_rows_lt": 80 }, "then": "exclude" },
+      { "if": { "missing_rate_gt": 0.0 }, "then": "exclude_or_require_imputation" }
+    ],
+
+    "preprocessing_dependencies": {
+      "required": ["time_sort"],
+      "optional": ["seasonality_check", "level_shift_review"],
+      "forbidden": ["random_split", "global_shuffle"]
+    },
+
+    "interpretability": {
+      "level": "high",
+      "explainable_methods": ["level_trend_seasonality_components"]
+    },
+
+    "operational": {
+      "training_speed": "fast",
+      "inference_latency": "low",
+      "gpu_required": false
+    }
+  },
+
+  {
+    "model_id": "prophet",
+    "model_name": "Prophet",
+    "family": "time_series_decomposition",
+    "target_type": ["time_series"],
+
+    "data_requirements": {
+      "min_rows": 200,
+      "supports_missing": true,
+      "stationary_required": false,
+      "scaling_required": false,
+      "multivariate_support": true
+    },
+
+    "feature_preferences": {
+      "temporal_dependency": true,
+      "nonlinear": true,
+      "seasonality": true,
+      "regime_shift_tolerance": "medium"
+    },
+
+    "applicability_signals": {
+      "n_rows_range": [200, 2000000],
+      "seasonality_strength_min": 0.30,
+      "trend_strength_min": 0.20,
+      "regime_change_score_min": 0.15,
+      "changepoint_density_min": 0.01,
+      "missing_rate_max": 0.40,
+      "horizon_steps_range": [7, 365]
+    },
+
+    "exclusion_rules": [
+      { "if": { "n_rows_lt": 200 }, "then": "exclude" },
+      { "if": { "seasonality_strength_lt": 0.15 }, "then": "deprioritize" }
+    ],
+
+    "preprocessing_dependencies": {
+      "required": ["datetime_index"],
+      "optional": ["holiday_features", "cap_floor_if_logistic_growth", "event_regressors"],
+      "forbidden": ["random_split", "global_shuffle"]
+    },
+
+    "interpretability": {
+      "level": "medium",
+      "explainable_methods": ["trend_seasonality", "changepoints", "regressor_effects"]
+    },
+
+    "operational": {
+      "training_speed": "fast",
+      "inference_latency": "low",
+      "gpu_required": false
+    }
+  }
+]
