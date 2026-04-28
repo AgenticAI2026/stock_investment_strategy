@@ -12,6 +12,7 @@ from agents.feature_table.agent import FeatureExtractionAgent
 from agents.prep_reco.agent import PreprocessingRecommenderAgent
 from agents.model_match_v1.agent import ModelDataMatcherAgent
 from agents.prep_apply.agent import PreprocessingImplementorAgent
+from agents.market_analysis.agent import MarketAnalysisAgent
 
 
 class PipelineState(TypedDict, total=False):
@@ -95,6 +96,10 @@ def run_prep_apply(state: PipelineState) -> PipelineState:
     agent = PreprocessingImplementorAgent()
     return _run_stage(state, "prep_apply", agent)
 
+def run_market_analysis(state: PipelineState) -> PipelineState:
+    agent = MarketAnalysisAgent()
+    return _run_stage(state, "market_analysis", agent)
+
 
 def build_pipeline():
     graph = StateGraph(PipelineState)
@@ -104,12 +109,14 @@ def build_pipeline():
     graph.add_node("prep_reco", run_prep_reco)
     graph.add_node("model_match_v1", run_model_match_v1)
     graph.add_node("prep_apply", run_prep_apply)
+    graph.add_node("market_analysis", run_market_analysis)
 
     graph.set_entry_point("ingest")
     graph.add_edge("ingest", "feature_table")
     graph.add_edge("feature_table", "prep_reco")
     graph.add_edge("prep_reco", "model_match_v1")
     graph.add_edge("model_match_v1", "prep_apply")
-    graph.add_edge("prep_apply", END)
+    graph.add_edge("prep_apply", "market_analysis")
+    graph.add_edge("market_analysis", END)
 
     return graph.compile()
