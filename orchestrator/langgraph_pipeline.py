@@ -14,6 +14,7 @@ from agents.model_match_v1.agent import ModelDataMatcherAgent
 from agents.prep_apply.agent import PreprocessingImplementorAgent
 from agents.market_analysis.agent import MarketAnalysisAgent
 from agents.news_invest_rag.agent import NewsInvestigationAgent
+from agents.risk_score.agent import RiskScoreAgent
 
 
 class PipelineState(TypedDict, total=False):
@@ -105,6 +106,9 @@ def run_news_invest_rag(state: PipelineState) -> PipelineState:
     agent = NewsInvestigationAgent()
     return _run_stage(state, "news_invest_rag", agent)
 
+def run_risk_score(state: PipelineState) -> PipelineState:
+    agent = RiskScoreAgent()
+    return _run_stage(state, "risk_score", agent)
 
 def build_pipeline():
     graph = StateGraph(PipelineState)
@@ -116,6 +120,7 @@ def build_pipeline():
     graph.add_node("prep_apply", run_prep_apply)
     graph.add_node("market_analysis", run_market_analysis)
     graph.add_node("news_invest_rag", run_news_invest_rag)
+    graph.add_node("risk_score", run_risk_score)
 
     graph.set_entry_point("ingest")
     graph.add_edge("ingest", "feature_table")
@@ -124,6 +129,7 @@ def build_pipeline():
     graph.add_edge("model_match_v1", "prep_apply")
     graph.add_edge("prep_apply", "market_analysis")
     graph.add_edge("market_analysis", "news_invest_rag")
-    graph.add_edge("news_invest_rag", END)
+    graph.add_edge("news_invest_rag", "risk_score")
+    graph.add_edge("risk_score", END)
 
     return graph.compile()
