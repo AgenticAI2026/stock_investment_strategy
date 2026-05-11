@@ -21,3 +21,8 @@ jupyter
 # Pipeline
 prefect
 langgraph
+
+# model
+scipy
+scikit-learn
+lightgbm
