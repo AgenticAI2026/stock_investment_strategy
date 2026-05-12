@@ -17,6 +17,7 @@ from agents.news_invest_rag.agent import NewsInvestigationAgent
 from agents.risk_score.agent import RiskScoreAgent
 from agents.model_match_v2.agent import ModelTargetMatcherAgent
 from agents.model_infer.agent import ModelInferenceAgent
+from agents.report_gen.agent import ReportGenerativeAgent
 
 
 class PipelineState(TypedDict, total=False):
@@ -120,6 +121,10 @@ def run_model_infer(state: PipelineState) -> PipelineState:
     agent = ModelInferenceAgent()
     return _run_stage(state, "model_infer", agent)
 
+def run_report_gen(state: PipelineState) -> PipelineState:
+    agent = ReportGenerativeAgent()
+    return _run_stage(state, "report_gen", agent)
+
 def build_pipeline():
     graph = StateGraph(PipelineState)
     graph.add_node("ingest", run_ingest)
@@ -132,6 +137,7 @@ def build_pipeline():
     graph.add_node("risk_score", run_risk_score)
     graph.add_node("model_match_v2", run_model_match_v2)
     graph.add_node("model_infer", run_model_infer)
+    graph.add_node("report_gen", run_report_gen)
 
     graph.set_entry_point("ingest")
     graph.add_edge("ingest", "feature_table")
@@ -143,6 +149,7 @@ def build_pipeline():
     graph.add_edge("news_invest_rag", "risk_score")
     graph.add_edge("risk_score", "model_match_v2")
     graph.add_edge("model_match_v2", "model_infer")
-    graph.add_edge("model_infer", END)
+    graph.add_edge("model_infer", "report_gen")
+    graph.add_edge("report_gen", END)
 
     return graph.compile()
