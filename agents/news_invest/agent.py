@@ -19,7 +19,7 @@ from core.artifacts import ArtifactPaths
 
 
 class NewsInvestigationAgent(BaseAgent):
-    stage = "news_invest_rag"
+    stage = "news_invest"
 
     def __init__(
         self,
@@ -53,7 +53,7 @@ class NewsInvestigationAgent(BaseAgent):
 
             return StageResult.success(
                 stage=self.stage,
-                outputs=[outputs["news_invest_rag_result"]],
+                outputs=[outputs["news_invest_result"]],
             )
         except Exception as e:
             ctx.logger.exception("❌ News Investigation Agent Failed")
@@ -88,7 +88,7 @@ class NewsInvestigationAgent(BaseAgent):
         if not news_features_path:
             raise FileNotFoundError(f"news_features_by_stock 파일을 찾지 못했습니다: {prep_apply_dir}")
 
-        output_json_path = stage_dir / "news_invest_rag_result.json"
+        output_json_path = stage_dir / "news_invest_result.json"
 
         ctx.logger.info("news_raw_path=%s", news_raw_path)
         ctx.logger.info("news_features_path=%s", news_features_path)
@@ -532,7 +532,7 @@ class NewsInvestigationAgent(BaseAgent):
             json.dump(out, f, ensure_ascii=False, indent=2)
 
         return {
-            "news_invest_rag_result": self.output_path,
-            "news_invest_rag_result_json": self.output_path,
+            "news_invest_result": self.output_path,
+            "news_invest_result_json": self.output_path,
             "result": out,
         }

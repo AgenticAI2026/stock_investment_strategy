@@ -106,7 +106,7 @@ class ModelInferenceAgent(BaseAgent):
             "finance": self._find_single_file(run_dir, "preprocessed__*__finance__financial_features.csv", ctx),
             "user": self._find_single_file(run_dir, "preprocessed__*__user__user_snapshot.csv", ctx),
             "market_json": self._find_single_file(run_dir, "market_analysis_result.json", ctx),
-            "news_json": self._find_single_file(run_dir, "news_invest_rag_result.json", ctx),
+            "news_json": self._find_single_file(run_dir, "news_invest_result.json", ctx),
             "risk_json": self._find_single_file(run_dir, "risk_score_result.json", ctx),
         }
 
@@ -998,7 +998,7 @@ class ModelInferenceAgent(BaseAgent):
 
         cols = []
         cols += aj.get("market_analysis", [])
-        cols += aj.get("news_invest_rag", [])
+        cols += aj.get("news_invest", [])
         cols += aj.get("risk_score", [])
         cols = list(dict.fromkeys(cols))
 
