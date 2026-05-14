@@ -63,7 +63,7 @@ class ReportGenerativeAgent(BaseAgent):
             # optional upstream analysis files
             "risk_json": self._find_exact_file(run_dir, "risk_score_result.json"),
             "market_json": self._find_exact_file(run_dir, "market_analysis_result.json"),
-            "news_json": self._find_exact_file(run_dir, "news_invest_rag_result.json"),
+            "news_json": self._find_exact_file(run_dir, "news_invest_result.json"),
         }
 
         required = ["metrics", "predictions", "feature_importance", "personalized_scores"]

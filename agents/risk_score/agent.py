@@ -302,7 +302,7 @@ class RiskScoreAgent:
                     "news_event_risk": 0.10,
                     "uncertainty_risk": 0.05,
                 },
-                "note": "market_analysis_result의 실제 구조와 news_invest_rag_result의 실제 구조만 사용해 리스크 점수를 계산함.",
+                "note": "market_analysis_result의 실제 구조와 news_invest_result의 실제 구조만 사용해 리스크 점수를 계산함.",
             },
             "universe_summary": universe_summary,
             "tickers": out_rows,
@@ -436,12 +436,12 @@ class RiskScoreAgent:
     def execute(self, ctx: RunContext, ap: ArtifactPaths) -> StageResult:
         try:
             market_dir = Path(ap.stage_dir("market_analysis"))
-            news_dir = Path(ap.stage_dir("news_invest_rag"))
+            news_dir = Path(ap.stage_dir("news_invest"))
             self.output_dir = Path(ap.stage_dir(self.stage))
             self.output_dir.mkdir(parents=True, exist_ok=True)
 
             self.market_json_path = market_dir / "market_analysis_result.json"
-            self.news_json_path = news_dir / "news_invest_rag_result.json"
+            self.news_json_path = news_dir / "news_invest_result.json"
             self.out_json_path = self.output_dir / "risk_score_result.json"
 
             for required in [self.market_json_path, self.news_json_path]:
