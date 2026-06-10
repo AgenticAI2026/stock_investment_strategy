@@ -26,3 +26,7 @@ langgraph
 scipy
 scikit-learn
 lightgbm
+
+#LLM
+google-genai
+openai
