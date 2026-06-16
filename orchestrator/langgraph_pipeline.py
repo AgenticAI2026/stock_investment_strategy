@@ -15,9 +15,8 @@ from agents.prep_apply.agent import PreprocessingImplementorAgent
 from agents.market_analysis.agent import MarketAnalysisAgent
 from agents.news_invest.agent import NewsInvestigationAgent
 from agents.risk_score.agent import RiskScoreAgent
+from agents.market_flow.agent import MarketFlowAgent
 from agents.report_target_planner.agent import ReportTargetPlannerAgent
-from agents.model_infer.agent import ModelInferenceAgent
-from agents.report_gen.agent import ReportGenerativeAgent
 
 
 class PipelineState(TypedDict, total=False):
@@ -117,13 +116,21 @@ def run_report_target_planner(state: PipelineState) -> PipelineState:
     agent = ReportTargetPlannerAgent()
     return _run_stage(state, "report_target_planner", agent)
 
-def run_model_infer(state: PipelineState) -> PipelineState:
-    agent = ModelInferenceAgent()
-    return _run_stage(state, "model_infer", agent)
+def run_market_flow(state: PipelineState) -> PipelineState:
+    agent = MarketFlowAgent()
+    return _run_stage(state, "market_flow", agent)
 
-def run_report_gen(state: PipelineState) -> PipelineState:
-    agent = ReportGenerativeAgent()
-    return _run_stage(state, "report_gen", agent)
+# def run_model_match_v2(state: PipelineState) -> PipelineState:
+#     agent = ModelTargetMatcherAgent()
+#     return _run_stage(state, "model_match_v2", agent)
+
+# def run_model_infer(state: PipelineState) -> PipelineState:
+#     agent = ModelInferenceAgent()
+#     return _run_stage(state, "model_infer", agent)
+
+# def run_report_gen(state: PipelineState) -> PipelineState:
+#     agent = ReportGenerativeAgent()
+#     return _run_stage(state, "report_gen", agent)
 
 def build_pipeline():
     graph = StateGraph(PipelineState)
@@ -136,8 +143,7 @@ def build_pipeline():
     graph.add_node("news_invest", run_news_invest)
     graph.add_node("risk_score", run_risk_score)
     graph.add_node("report_target_planner", run_report_target_planner)
-    graph.add_node("model_infer", run_model_infer)
-    graph.add_node("report_gen", run_report_gen)
+    graph.add_node("market_flow", run_market_flow)
 
     graph.set_entry_point("ingest")
     graph.add_edge("ingest", "feature_table")
@@ -148,8 +154,7 @@ def build_pipeline():
     graph.add_edge("market_analysis", "news_invest")
     graph.add_edge("news_invest", "risk_score")
     graph.add_edge("risk_score", "report_target_planner")
-    graph.add_edge("report_target_planner", "model_infer")
-    graph.add_edge("model_infer", "report_gen")
-    graph.add_edge("report_gen", END)
+    graph.add_edge("report_target_planner", "market_flow")
+    graph.add_edge("market_flow", END)
 
     return graph.compile()
