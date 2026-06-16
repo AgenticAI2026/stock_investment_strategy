@@ -47,7 +47,7 @@ class MarketFlowAgent(BaseAgent):
     """
 
     stage = "market_flow"
-    version = "1.2-date-aligned-foreign-force-ohlcv"
+    version = "1.3-planner-aware-market-flow"
 
     def __init__(
         self,
@@ -132,6 +132,31 @@ class MarketFlowAgent(BaseAgent):
                 "risk_score_result.json",
                 ctx,
             ),
+            "report_target_spec": self._find_single_file(
+                run_dir,
+                "report_target_spec.json",
+                ctx,
+            ),
+            "report_feature_contract": self._find_single_file(
+                run_dir,
+                "report_feature_contract.json",
+                ctx,
+            ),
+            "candidate_scoring_plan": self._find_single_file(
+                run_dir,
+                "candidate_scoring_plan.json",
+                ctx,
+            ),
+            "evidence_builder_contract": self._find_single_file(
+                run_dir,
+                "evidence_builder_contract.json",
+                ctx,
+            ),
+            "report_output_contract": self._find_single_file(
+                run_dir,
+                "report_output_contract.json",
+                ctx,
+            ),
         }
 
         ohlcv = self._safe_read_csv(paths["ohlcv"], ctx)
@@ -147,6 +172,12 @@ class MarketFlowAgent(BaseAgent):
 
         risk_json = self._safe_read_json(paths["risk_json"], ctx)
 
+        report_target_spec = self._safe_read_json(paths["report_target_spec"], ctx)
+        report_feature_contract = self._safe_read_json(paths["report_feature_contract"], ctx)
+        candidate_scoring_plan = self._safe_read_json(paths["candidate_scoring_plan"], ctx)
+        evidence_builder_contract = self._safe_read_json(paths["evidence_builder_contract"], ctx)
+        report_output_contract = self._safe_read_json(paths["report_output_contract"], ctx)
+
         deterministic_snapshot = self._build_deterministic_snapshot(
             ohlcv=ohlcv,
             news_feat=news_feat,
@@ -156,6 +187,11 @@ class MarketFlowAgent(BaseAgent):
             market_json=market_json,
             news_json=news_json,
             risk_json=risk_json,
+            report_target_spec=report_target_spec,
+            report_feature_contract=report_feature_contract,
+            candidate_scoring_plan=candidate_scoring_plan,
+            evidence_builder_contract=evidence_builder_contract,
+            report_output_contract=report_output_contract,
             ctx=ctx,
         )
 
@@ -226,6 +262,11 @@ class MarketFlowAgent(BaseAgent):
             "has_market_json": market_json is not None,
             "has_news_json": news_json is not None,
             "has_risk_json": risk_json is not None,
+            "has_report_target_spec": report_target_spec is not None,
+            "has_report_feature_contract": report_feature_contract is not None,
+            "has_candidate_scoring_plan": candidate_scoring_plan is not None,
+            "has_evidence_builder_contract": evidence_builder_contract is not None,
+            "has_report_output_contract": report_output_contract is not None,
             "compact_snapshot_chars": len(snapshot_text),
             "n_core_drivers": len(llm_result.get("core_market_drivers", [])),
             "n_keywords": len(llm_result.get("market_keywords", [])),
@@ -262,6 +303,11 @@ class MarketFlowAgent(BaseAgent):
         market_json: Optional[Dict[str, Any]],
         news_json: Optional[Dict[str, Any]],
         risk_json: Optional[Dict[str, Any]],
+        report_target_spec: Optional[Dict[str, Any]],
+        report_feature_contract: Optional[Dict[str, Any]],
+        candidate_scoring_plan: Optional[Dict[str, Any]],
+        evidence_builder_contract: Optional[Dict[str, Any]],
+        report_output_contract: Optional[Dict[str, Any]],
         ctx: RunContext,
     ) -> Dict[str, Any]:
         primary_as_of_date = self._infer_as_of_date(ohlcv)
@@ -298,6 +344,15 @@ class MarketFlowAgent(BaseAgent):
             target_date=primary_as_of_date,
         )
 
+        planner_context = self._extract_planner_context(
+            report_target_spec=report_target_spec,
+            report_feature_contract=report_feature_contract,
+            candidate_scoring_plan=candidate_scoring_plan,
+            evidence_builder_contract=evidence_builder_contract,
+            report_output_contract=report_output_contract,
+            target_date=primary_as_of_date,
+        )
+
         return {
             "as_of_date": primary_as_of_date,
             "primary_as_of_date_source": "ohlcv",
@@ -323,7 +378,12 @@ class MarketFlowAgent(BaseAgent):
                     "News/Risk agent output as_of_date may be execution date, "
                     "so it is not used alone to drop all rows."
                 ),
+                "planner_rule": (
+                    "Report Target Planner output is used as the report objective and "
+                    "output contract. Market Flow summary must align with this plan."
+                ),
             },
+            "planner_context": planner_context,
             "price_market_snapshot": price_market_snapshot,
             "news_feature_overview": news_feature_overview,
             "foreign_flow_overview": foreign_flow_overview,
@@ -333,6 +393,144 @@ class MarketFlowAgent(BaseAgent):
             "news_overview": news_overview,
             "risk_overview": risk_overview,
         }
+
+
+    def _extract_planner_context(
+        self,
+        report_target_spec: Optional[Dict[str, Any]],
+        report_feature_contract: Optional[Dict[str, Any]],
+        candidate_scoring_plan: Optional[Dict[str, Any]],
+        evidence_builder_contract: Optional[Dict[str, Any]],
+        report_output_contract: Optional[Dict[str, Any]],
+        target_date: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Report Target Planner Agent 결과를 Market Flow Agent의 방향성 input으로 요약한다.
+
+        목적:
+        - Market Flow가 일반 시장 요약이 아니라, Planner가 정의한 리포트 목적에 맞춰 요약하도록 한다.
+        - Candidate Scoring Agent가 사용할 scoring hints를 Planner의 scoring target과 맞춘다.
+        - 최종 리포트의 tone, 금지 표현, required output과 충돌하지 않도록 한다.
+        """
+        if not any([
+            report_target_spec,
+            report_feature_contract,
+            candidate_scoring_plan,
+            evidence_builder_contract,
+            report_output_contract,
+        ]):
+            return {
+                "exists": False,
+                "warning": "Report Target Planner outputs were not found. Market Flow will use default market-flow candidate report objective.",
+            }
+
+        spec = report_target_spec or {}
+        feature_contract = report_feature_contract or {}
+        scoring_plan = candidate_scoring_plan or {}
+        evidence_contract = evidence_builder_contract or {}
+        output_contract = report_output_contract or {}
+
+        planner_as_of_date = spec.get("as_of_date")
+        target_ts = self._parse_date_or_none(target_date)
+        planner_ts = self._parse_date_or_none(planner_as_of_date)
+
+        date_warning = None
+        if target_ts is not None and planner_ts is not None and planner_ts != target_ts:
+            date_warning = (
+                f"Planner as_of_date {planner_as_of_date} differs from OHLCV as_of_date {target_date}. "
+                "OHLCV as_of_date is used as canonical report date."
+            )
+
+        downstream_agents = spec.get("downstream_agents", []) or []
+        market_flow_stage = None
+        if isinstance(downstream_agents, list):
+            for item in downstream_agents:
+                if isinstance(item, dict) and item.get("stage") == "market_flow":
+                    market_flow_stage = item
+                    break
+
+        score_components = scoring_plan.get("score_components", []) or []
+        compact_components = []
+        if isinstance(score_components, list):
+            for item in score_components:
+                if not isinstance(item, dict):
+                    continue
+                compact_components.append({
+                    "component": item.get("component"),
+                    "weight": item.get("weight"),
+                    "direction": item.get("direction"),
+                    "description": item.get("description"),
+                    "example_signals": self._safe_list(item.get("example_signals"), limit=4),
+                })
+
+        final_report = output_contract.get("final_report", {}) or {}
+        sections = final_report.get("sections", []) or []
+        compact_sections = []
+        if isinstance(sections, list):
+            for section in sections:
+                if not isinstance(section, dict):
+                    continue
+                compact_sections.append({
+                    "section_id": section.get("section_id"),
+                    "title": section.get("title"),
+                    "required_fields": self._safe_list(section.get("required_fields"), limit=10),
+                })
+
+        usage = feature_contract.get("usage_by_downstream_agent", {}) or {}
+        market_flow_usage = usage.get("market_flow", {}) or {}
+
+        candidate_definition = spec.get("candidate_definition", {}) or {}
+        anti_hallucination_policy = spec.get("anti_hallucination_policy", {}) or {}
+        report_gen_policy = output_contract.get("report_gen_policy", {}) or {}
+
+        return {
+            "exists": True,
+            "aligned_to_date": target_date,
+            "planner_as_of_date": planner_as_of_date,
+            "date_warning": date_warning,
+            "report_type": spec.get("report_type"),
+            "report_title": spec.get("report_title"),
+            "main_objective": spec.get("main_objective"),
+            "ranking_target": spec.get("ranking_target"),
+            "ranking_scope": spec.get("ranking_scope"),
+            "prediction_horizon": spec.get("prediction_horizon"),
+            "candidate_definition": {
+                "candidate_type": candidate_definition.get("candidate_type"),
+                "meaning": candidate_definition.get("meaning"),
+                "not_allowed_interpretation": self._safe_list(
+                    candidate_definition.get("not_allowed_interpretation"),
+                    limit=10,
+                ),
+            },
+            "required_outputs": self._safe_list(spec.get("required_outputs"), limit=20),
+            "market_flow_stage_contract": {
+                "role": (market_flow_stage or {}).get("role"),
+                "expected_output": (market_flow_stage or {}).get("expected_output"),
+                "required_feature_groups": self._safe_list(
+                    market_flow_usage.get("required_groups"),
+                    limit=20,
+                ),
+                "purpose": market_flow_usage.get("purpose"),
+            },
+            "scoring_target": scoring_plan.get("scoring_target", {}),
+            "scoring_formula": scoring_plan.get("formula"),
+            "score_components": compact_components,
+            "evidence_builder_purpose": evidence_contract.get("purpose"),
+            "final_report": {
+                "tone": final_report.get("tone"),
+                "investment_disclaimer_style": final_report.get("investment_disclaimer_style"),
+                "sections": compact_sections,
+            },
+            "anti_hallucination_rules": self._safe_list(
+                anti_hallucination_policy.get("rules"),
+                limit=10,
+            ),
+            "report_gen_not_allowed": self._safe_list(
+                report_gen_policy.get("not_allowed"),
+                limit=10,
+            ),
+        }
+
 
     # =========================================================
     # Compact summaries
@@ -549,14 +747,24 @@ class MarketFlowAgent(BaseAgent):
             if col in work.columns:
                 work[col] = pd.to_numeric(work[col], errors="coerce")
 
+        ratio_note = None
+
         if "foreign_net_flow_ratio" not in work.columns:
-            return {
-                "exists": True,
-                "latest_date": target_date,
-                "aligned_to_date": target_date,
-                "date_source": "forced_to_ohlcv_as_of_date",
-                "warning": "foreign_net_flow_ratio column not found",
-            }
+            if "frgn_ntby_qty" in work.columns and "volume" in work.columns:
+                safe_volume = work["volume"].replace(0, np.nan)
+                work["foreign_net_flow_ratio"] = work["frgn_ntby_qty"] / safe_volume
+                ratio_note = "foreign_net_flow_ratio was derived as frgn_ntby_qty / volume."
+            else:
+                return {
+                    "exists": True,
+                    "latest_date": target_date,
+                    "aligned_to_date": target_date,
+                    "date_source": "forced_to_ohlcv_as_of_date",
+                    "warning": (
+                        "foreign_net_flow_ratio column not found and cannot be derived "
+                        "because frgn_ntby_qty or volume is missing."
+                    ),
+                }
 
         keep_cols = [
             c for c in [
@@ -590,6 +798,7 @@ class MarketFlowAgent(BaseAgent):
                 "Foreign file date column is ignored because it represents collection date. "
                 "Foreign flow snapshot is treated as OHLCV as_of_date."
             ),
+            "ratio_note": ratio_note,
             "n_rows": int(len(work)),
             "avg_foreign_net_flow_ratio": self._safe_float(
                 work["foreign_net_flow_ratio"].mean()
@@ -1077,17 +1286,19 @@ class MarketFlowAgent(BaseAgent):
 당신은 한국 주식 초보 투자자를 위한 금융 리포트의 Market Flow Agent입니다.
 
 목표:
+- Report Target Planner Agent가 정의한 리포트 목적, 후보 정의, 출력 필드, 금지 표현을 우선 참고합니다.
 - 전처리된 시세/뉴스/외국인 수급/재무 데이터와 기존 market/news/risk agent 결과 요약을 종합합니다.
 - 최종 리포트의 맨 위에 들어갈 "오늘 시장 한 줄 요약"을 생성합니다.
 - 이후 Candidate Scoring Agent가 사용할 수 있도록 시장 핵심 키워드, 긍정 신호, 부정 신호, 관련 업종/테마 힌트를 구조화합니다.
 - 결과는 초보 투자자가 이해할 수 있는 쉬운 한국어로 작성합니다.
-- 단, 과장된 투자 권유 표현은 피하고, "후보", "주목", "확인 필요" 정도의 표현을 사용합니다.
+- 단, 과장된 투자 권유 표현은 피하고, "후보", "관심", "주목", "확인 필요" 정도의 표현을 사용합니다.
 
 중요:
 - 반드시 입력 데이터에 근거해서만 작성하세요.
 - 없는 사실을 지어내지 마세요.
 - 특정 종목 매수/매도 권유처럼 쓰지 마세요.
-- 보고서 제목의 방향은 "시장 흐름 기반 유망 종목 후보 리포트"입니다.
+- Planner context가 있으면 report_title, main_objective, candidate_definition, required_outputs를 우선 준수하세요.
+- 보고서 제목의 방향은 기본적으로 "시장 흐름 기반 유망 종목 후보 리포트"입니다.
 - 출력은 반드시 JSON만 반환하세요.
 - 입력 데이터는 전체 주식시장이 아니라 분석 대상 종목 유니버스일 수 있습니다.
 - 따라서 "시장 전체", "전체 시장"이라는 표현은 가급적 피하고, "분석 대상 종목", "분석 대상 유니버스", "분석 대상 종목군"이라고 표현하세요.
@@ -1096,6 +1307,8 @@ class MarketFlowAgent(BaseAgent):
 - 뉴스는 기준일 이하의 기사만 사용된 것으로 간주하세요.
 - agent 결과의 original_as_of_date가 기준일보다 늦더라도, 그것은 실행일일 수 있으므로 기준일 자체로 표현하지 마세요.
 - 기준일이 다른 보조 데이터가 있으면 limitations에 간단히 언급하세요.
+- candidate_score 또는 market_flow_candidate_score를 미래 수익률, 매수 추천, 수익 보장처럼 해석하지 마세요.
+- Candidate Scoring Hints는 Planner의 scoring components와 일관되게 작성하세요.
 
 출력 JSON 스키마:
 {{
@@ -1359,6 +1572,16 @@ class MarketFlowAgent(BaseAgent):
         news_overview = snapshot.get("news_overview", {}) or {}
         risk_overview = snapshot.get("risk_overview", {}) or {}
         foreign_overview = snapshot.get("foreign_flow_overview", {}) or {}
+        planner_context = snapshot.get("planner_context", {}) or {}
+
+        report_title = (
+            planner_context.get("report_title")
+            or "시장 흐름 기반 유망 종목 후보 리포트"
+        )
+
+        candidate_meaning = (
+            planner_context.get("candidate_definition", {}) or {}
+        ).get("meaning") or "후보 종목은 매수 추천이 아니라 관심 있게 확인할 만한 종목입니다."
 
         market_phase = market_overview.get("market_phase") or "혼재 국면"
         market_tone = market_overview.get("market_tone") or "mixed"
@@ -1489,6 +1712,10 @@ class MarketFlowAgent(BaseAgent):
                     "외국인 순매도 비율이 큰 종목",
                 ],
                 "preferred_sectors_or_themes": preferred_themes,
+                "planner_based_context": [
+                    f"리포트 제목: {report_title}",
+                    candidate_meaning,
+                ],
                 "risk_filters": [
                     "risk_level high 종목은 후보 점수에서 감점",
                     "RSI 강한 과열 종목은 단기 과열 주의 표시",
