@@ -37,21 +37,17 @@ class MarketFlowAgent(BaseAgent):
     """
     Market Flow Agent
 
-    목적:
-    - 전처리된 시세/뉴스/외국인 수급/재무 데이터와
-      market/news/risk agent 결과를 종합한다.
-    - 최종 리포트의 상단에 들어갈 "오늘 시장 한 줄 요약"을 생성한다.
-    - Candidate Scoring Agent가 사용할 수 있도록
-      시장 키워드, 긍정 신호, 부정 신호, 리스크 필터를 구조화한다.
-
-    생성 순서:
-    1. Gemini 시도
-    2. Gemini 실패 시 OpenAI 시도
-    3. OpenAI도 실패하면 deterministic fallback 생성
+    기준일 정책:
+    1. 리포트 기준일은 OHLCV 최신 날짜로 고정한다.
+    2. 외국인 수급 데이터의 date 컬럼은 수집일일 수 있으므로 판단 기준으로 사용하지 않는다.
+       외국인 수급 데이터는 OHLCV 최신 날짜 기준 데이터로 간주한다.
+    3. 뉴스는 기준일 이하의 기사만 사용한다.
+    4. news/risk agent 결과의 as_of_date가 실행일 기준으로 찍혀 있어도,
+       MarketFlow에서는 무조건 제외하지 않고 기준일 차이를 기록한다.
     """
 
     stage = "market_flow"
-    version = "1.1-gemini-openai-fallback-compact"
+    version = "1.2-date-aligned-foreign-force-ohlcv"
 
     def __init__(
         self,
@@ -91,7 +87,6 @@ class MarketFlowAgent(BaseAgent):
         ctx.logger.info("[MarketFlowAgent] Starting market flow analysis.")
 
         paths = {
-            # preprocessed files
             "ohlcv": self._find_single_file(
                 run_dir,
                 "preprocessed__*__price__ohlcv_last365.csv",
@@ -117,8 +112,6 @@ class MarketFlowAgent(BaseAgent):
                 "preprocessed__*__user__user_snapshot.csv",
                 ctx,
             ),
-
-            # upstream agent outputs
             "market_json": self._find_single_file(
                 run_dir,
                 "market_analysis_result.json",
@@ -149,7 +142,6 @@ class MarketFlowAgent(BaseAgent):
 
         market_json = self._safe_read_json(paths["market_json"], ctx)
 
-        # RAG 버전이 있으면 우선 사용, 없으면 일반 news_invest_result 사용
         news_json_path = paths["news_json_rag"] or paths["news_json"]
         news_json = self._safe_read_json(news_json_path, ctx)
 
@@ -222,6 +214,7 @@ class MarketFlowAgent(BaseAgent):
             "llm_model_used": llm_result.get("generation_model"),
             "compact_snapshot_chars": len(snapshot_text),
         }
+
         self._save_json(manifest, artifacts.manifest_path)
 
         metrics = {
@@ -256,7 +249,7 @@ class MarketFlowAgent(BaseAgent):
         )
 
     # =========================================================
-    # Snapshot builder: compact deterministic summary
+    # Snapshot builder
     # =========================================================
 
     def _build_deterministic_snapshot(
@@ -271,31 +264,79 @@ class MarketFlowAgent(BaseAgent):
         risk_json: Optional[Dict[str, Any]],
         ctx: RunContext,
     ) -> Dict[str, Any]:
-        """
-        LLM에 전체 JSON/CSV를 넘기지 않고,
-        시장 흐름 판단에 필요한 요약 정보만 만든다.
+        primary_as_of_date = self._infer_as_of_date(ohlcv)
 
-        핵심:
-        - market_analysis_result 전체 X -> market_overview 일부만
-        - news_invest_result 전체 X -> 뉴스 신호 상위 10개만
-        - risk_score_result 전체 X -> 리스크 요약 + high risk 상위 10개만
-        - finance 전체 연도 X -> 최신 연도 기준 평균 요약만
-        """
+        price_market_snapshot = self._summarize_ohlcv_compact(ohlcv, ctx)
+
+        news_feature_overview = self._summarize_news_features_compact(
+            news_feat,
+            ctx,
+            target_date=primary_as_of_date,
+        )
+
+        foreign_flow_overview = self._summarize_foreign_flow_compact(
+            foreign,
+            ctx,
+            target_date=primary_as_of_date,
+        )
+
+        finance_overview = self._summarize_finance_compact(finance, ctx)
+        user_overview = self._summarize_user_compact(user)
+
+        market_overview = self._extract_market_overview(
+            market_json,
+            target_date=primary_as_of_date,
+        )
+
+        news_overview = self._extract_news_overview(
+            news_json,
+            target_date=primary_as_of_date,
+        )
+
+        risk_overview = self._extract_risk_overview(
+            risk_json,
+            target_date=primary_as_of_date,
+        )
+
         return {
-            "as_of_date": self._infer_as_of_date(ohlcv),
-
-            # CSV 기반 compact 요약
-            "price_market_snapshot": self._summarize_ohlcv_compact(ohlcv, ctx),
-            "news_feature_overview": self._summarize_news_features_compact(news_feat, ctx),
-            "foreign_flow_overview": self._summarize_foreign_flow_compact(foreign, ctx),
-            "finance_overview": self._summarize_finance_compact(finance, ctx),
-            "user_overview": self._summarize_user_compact(user),
-
-            # 기존 Agent 결과 compact 요약
-            "market_overview": self._extract_market_overview(market_json),
-            "news_overview": self._extract_news_overview(news_json),
-            "risk_overview": self._extract_risk_overview(risk_json),
+            "as_of_date": primary_as_of_date,
+            "primary_as_of_date_source": "ohlcv",
+            "data_dates": {
+                "price_date": price_market_snapshot.get("latest_date"),
+                "news_feature_date": news_feature_overview.get("latest_date"),
+                "foreign_flow_date": foreign_flow_overview.get("latest_date"),
+                "market_agent_date": market_overview.get("as_of_date"),
+                "news_agent_date": news_overview.get("latest_as_of_date_used"),
+                "risk_agent_date": risk_overview.get("latest_as_of_date_used"),
+            },
+            "date_alignment_policy": {
+                "primary_rule": "OHLCV latest_date is used as the report as_of_date.",
+                "foreign_rule": (
+                    "Foreign flow file date column is treated as collection date, "
+                    "so it is ignored. Foreign data is forced to OHLCV as_of_date."
+                ),
+                "news_rule": (
+                    "News articles are filtered to published_at/date <= OHLCV as_of_date "
+                    "when article-level dates are available."
+                ),
+                "agent_result_rule": (
+                    "News/Risk agent output as_of_date may be execution date, "
+                    "so it is not used alone to drop all rows."
+                ),
+            },
+            "price_market_snapshot": price_market_snapshot,
+            "news_feature_overview": news_feature_overview,
+            "foreign_flow_overview": foreign_flow_overview,
+            "finance_overview": finance_overview,
+            "user_overview": user_overview,
+            "market_overview": market_overview,
+            "news_overview": news_overview,
+            "risk_overview": risk_overview,
         }
+
+    # =========================================================
+    # Compact summaries
+    # =========================================================
 
     def _summarize_ohlcv_compact(
         self,
@@ -328,7 +369,6 @@ class MarketFlowAgent(BaseAgent):
 
         last_two = work.groupby(ticker_col).tail(2).copy()
         last_two["prev_close"] = last_two.groupby(ticker_col)[close_col].shift(1)
-
         last_two["daily_return"] = (
             pd.to_numeric(last_two[close_col], errors="coerce")
             / pd.to_numeric(last_two["prev_close"], errors="coerce")
@@ -370,11 +410,13 @@ class MarketFlowAgent(BaseAgent):
         self,
         df: Optional[pd.DataFrame],
         ctx: RunContext,
+        target_date: Optional[str] = None,
     ) -> Dict[str, Any]:
         if df is None or df.empty:
             return {"exists": False}
 
         ticker_col = self._infer_col(df, ["종목코드", "ticker", "code", "symbol"])
+
         if ticker_col is None:
             return {
                 "exists": True,
@@ -385,6 +427,38 @@ class MarketFlowAgent(BaseAgent):
 
         work = df.copy()
         work[ticker_col] = work[ticker_col].apply(self._zfill6)
+
+        target_ts = self._parse_date_or_none(target_date)
+        date_col = self._infer_col(
+            work,
+            ["date", "datetime", "dt", "일자", "날짜", "as_of_date", "pubDate", "published_at"],
+        )
+
+        latest_date_used = None
+        date_filter_note = None
+
+        if date_col and target_ts is not None:
+            work[date_col] = pd.to_datetime(work[date_col], errors="coerce")
+            work = work.dropna(subset=[date_col])
+            work = work[work[date_col].dt.normalize() <= target_ts].copy()
+
+            if work.empty:
+                return {
+                    "exists": True,
+                    "latest_date": None,
+                    "aligned_to_date": target_date,
+                    "warning": "No news feature rows on or before OHLCV as_of_date.",
+                }
+
+            latest_date_used = work[date_col].max().normalize()
+            work = work[work[date_col].dt.normalize() == latest_date_used].copy()
+            date_filter_note = f"Filtered by {date_col} <= {target_date}."
+        else:
+            latest_date_used = self._parse_date_or_none(target_date)
+            date_filter_note = (
+                "No usable date column in news feature CSV. "
+                "Assuming upstream news feature file is already aligned to OHLCV as_of_date."
+            )
 
         numeric_targets = [
             "recent_news_ratio",
@@ -428,6 +502,9 @@ class MarketFlowAgent(BaseAgent):
 
         return {
             "exists": True,
+            "latest_date": str(latest_date_used.date()) if latest_date_used is not None else None,
+            "aligned_to_date": target_date,
+            "date_filter_note": date_filter_note,
             "n_rows": int(len(work)),
             "avg_event_news_ratio": self._safe_float(work["event_news_ratio"].mean())
             if "event_news_ratio" in work.columns else None,
@@ -441,12 +518,16 @@ class MarketFlowAgent(BaseAgent):
         self,
         df: Optional[pd.DataFrame],
         ctx: RunContext,
+        target_date: Optional[str] = None,
     ) -> Dict[str, Any]:
+        """
+        외국인 데이터의 date 컬럼은 수집일일 수 있으므로 절대 필터링 기준으로 사용하지 않는다.
+        이 파일 자체를 OHLCV 기준일의 외국인 수급 snapshot으로 간주한다.
+        """
         if df is None or df.empty:
             return {"exists": False}
 
         ticker_col = self._infer_col(df, ["종목코드", "ticker", "code", "symbol"])
-        date_col = self._infer_col(df, ["date", "datetime", "dt", "일자", "날짜"])
 
         if ticker_col is None:
             return {
@@ -458,13 +539,6 @@ class MarketFlowAgent(BaseAgent):
 
         work = df.copy()
         work[ticker_col] = work[ticker_col].apply(self._zfill6)
-
-        if date_col:
-            work[date_col] = pd.to_datetime(work[date_col], errors="coerce")
-            latest_date = work[date_col].max()
-            work = work[work[date_col] == latest_date].copy()
-        else:
-            latest_date = None
 
         for col in [
             "foreign_net_flow_ratio",
@@ -478,7 +552,9 @@ class MarketFlowAgent(BaseAgent):
         if "foreign_net_flow_ratio" not in work.columns:
             return {
                 "exists": True,
-                "latest_date": str(latest_date.date()) if pd.notna(latest_date) else None,
+                "latest_date": target_date,
+                "aligned_to_date": target_date,
+                "date_source": "forced_to_ohlcv_as_of_date",
                 "warning": "foreign_net_flow_ratio column not found",
             }
 
@@ -507,7 +583,14 @@ class MarketFlowAgent(BaseAgent):
 
         return {
             "exists": True,
-            "latest_date": str(latest_date.date()) if pd.notna(latest_date) else None,
+            "latest_date": target_date,
+            "aligned_to_date": target_date,
+            "date_source": "forced_to_ohlcv_as_of_date",
+            "date_note": (
+                "Foreign file date column is ignored because it represents collection date. "
+                "Foreign flow snapshot is treated as OHLCV as_of_date."
+            ),
+            "n_rows": int(len(work)),
             "avg_foreign_net_flow_ratio": self._safe_float(
                 work["foreign_net_flow_ratio"].mean()
             ),
@@ -601,9 +684,14 @@ class MarketFlowAgent(BaseAgent):
 
         return out
 
+    # =========================================================
+    # Agent result extraction
+    # =========================================================
+
     def _extract_market_overview(
         self,
         obj: Optional[Dict[str, Any]],
+        target_date: Optional[str] = None,
     ) -> Dict[str, Any]:
         if not obj:
             return {"exists": False}
@@ -611,9 +699,21 @@ class MarketFlowAgent(BaseAgent):
         market_overview = obj.get("market_overview", {}) or {}
         diagnostics = obj.get("diagnostics", {}) or {}
 
+        market_date = market_overview.get("as_of_date") or obj.get("meta", {}).get("as_of_date")
+        target_ts = self._parse_date_or_none(target_date)
+        market_ts = self._parse_date_or_none(market_date)
+
+        date_warning = None
+        if target_ts is not None and market_ts is not None and market_ts > target_ts:
+            date_warning = (
+                f"Market analysis date {market_date} is after OHLCV as_of_date {target_date}."
+            )
+
         return {
             "exists": True,
-            "as_of_date": market_overview.get("as_of_date"),
+            "aligned_to_date": target_date,
+            "as_of_date": market_date,
+            "date_warning": date_warning,
             "market_phase": market_overview.get("market_phase"),
             "market_tone": market_overview.get("market_tone"),
             "market_rsi_state": market_overview.get("market_rsi_state"),
@@ -631,7 +731,15 @@ class MarketFlowAgent(BaseAgent):
     def _extract_news_overview(
         self,
         obj: Optional[Dict[str, Any]],
+        target_date: Optional[str] = None,
     ) -> Dict[str, Any]:
+        """
+        news_invest_result의 ticker as_of_date는 실행일일 수 있으므로,
+        그 값만 보고 전부 제외하지 않는다.
+
+        대신 top_articles가 있으면 기사 published_at/date를 기준으로
+        target_date 이하 기사만 남긴다.
+        """
         if not obj:
             return {"exists": False}
 
@@ -641,8 +749,40 @@ class MarketFlowAgent(BaseAgent):
         if not isinstance(tickers, list):
             tickers = []
 
+        target_ts = self._parse_date_or_none(target_date)
+
+        original_count = len(tickers)
+        rows_with_future_articles_removed = 0
+        rows_without_valid_articles_after_filter = 0
+
+        processed_rows = []
+
+        for row in tickers:
+            if not isinstance(row, dict):
+                continue
+
+            row_copy = dict(row)
+            original_articles = row_copy.get("top_articles", [])
+
+            filtered_articles = self._filter_articles_until_date(
+                original_articles,
+                target_date=target_date,
+            )
+
+            if isinstance(original_articles, list) and len(filtered_articles) < len(original_articles):
+                rows_with_future_articles_removed += 1
+
+            row_copy["top_articles"] = filtered_articles
+
+            # 기사 정보가 없더라도 news_signal_score는 유지한다.
+            # 단, article-level 필터가 불가능한 경우를 note로 남긴다.
+            if isinstance(original_articles, list) and len(original_articles) > 0 and len(filtered_articles) == 0:
+                rows_without_valid_articles_after_filter += 1
+
+            processed_rows.append(row_copy)
+
         sorted_tickers = sorted(
-            tickers,
+            processed_rows,
             key=lambda x: x.get("news_signal_score", 0) or 0,
             reverse=True,
         )
@@ -650,12 +790,10 @@ class MarketFlowAgent(BaseAgent):
         high_signal = []
 
         for row in sorted_tickers[:self.max_rows_for_snapshot]:
-            if not isinstance(row, dict):
-                continue
-
             high_signal.append({
                 "ticker": row.get("ticker"),
-                "as_of_date": row.get("as_of_date"),
+                "as_of_date_original": row.get("as_of_date"),
+                "as_of_date_used": target_date,
                 "news_signal_score": row.get("news_signal_score"),
                 "confidence_level": row.get("confidence_level"),
                 "verdict": row.get("verdict"),
@@ -665,6 +803,21 @@ class MarketFlowAgent(BaseAgent):
 
         return {
             "exists": True,
+            "aligned_to_date": target_date,
+            "latest_as_of_date_used": target_date,
+            "original_agent_as_of_date": obj.get("meta", {}).get("as_of_date"),
+            "n_original_tickers": original_count,
+            "n_used_tickers": len(processed_rows),
+            "n_rows_with_future_articles_removed": rows_with_future_articles_removed,
+            "n_rows_without_valid_articles_after_filter": rows_without_valid_articles_after_filter,
+            "date_note": (
+                "Ticker-level news as_of_date is treated as agent execution date. "
+                "Article-level dates are filtered to OHLCV as_of_date when available."
+            ),
+            "score_caveat": (
+                "If news_signal_score was computed upstream using articles after the OHLCV as_of_date, "
+                "the score should be regenerated upstream for strict no-lookahead evaluation."
+            ),
             "universe_summary": universe_summary,
             "high_signal_tickers": high_signal,
         }
@@ -672,7 +825,13 @@ class MarketFlowAgent(BaseAgent):
     def _extract_risk_overview(
         self,
         obj: Optional[Dict[str, Any]],
+        target_date: Optional[str] = None,
     ) -> Dict[str, Any]:
+        """
+        risk_score_result의 as_of_date도 실행일일 수 있으므로,
+        OHLCV 기준일보다 늦다는 이유만으로 전부 제외하지 않는다.
+        대신 original_as_of_date와 aligned_to_date를 함께 기록한다.
+        """
         if not obj:
             return {"exists": False}
 
@@ -681,6 +840,8 @@ class MarketFlowAgent(BaseAgent):
 
         if not isinstance(tickers, list):
             tickers = []
+
+        original_count = len(tickers)
 
         def get_risk_score(row: Dict[str, Any]) -> float:
             scores = row.get("risk_scores", {}) or {}
@@ -702,7 +863,8 @@ class MarketFlowAgent(BaseAgent):
 
             high_risk.append({
                 "ticker": row.get("ticker"),
-                "as_of_date": row.get("as_of_date"),
+                "as_of_date_original": row.get("as_of_date"),
+                "as_of_date_used": target_date,
                 "overall_risk_score": scores.get("overall_risk_score"),
                 "risk_level": scores.get("risk_level"),
                 "dominant_risk_factors": self._safe_list(
@@ -714,36 +876,23 @@ class MarketFlowAgent(BaseAgent):
 
         return {
             "exists": True,
+            "aligned_to_date": target_date,
+            "latest_as_of_date_used": target_date,
+            "original_agent_as_of_date": obj.get("meta", {}).get("as_of_date"),
+            "n_original_tickers": original_count,
+            "n_used_tickers": len(sorted_tickers),
+            "date_note": (
+                "Risk agent as_of_date is treated as agent execution date unless upstream provides canonical price date."
+            ),
+            "score_caveat": (
+                "For strict no-lookahead evaluation, RiskScoreAgent should be regenerated using canonical OHLCV as_of_date."
+            ),
             "universe_summary": universe_summary,
             "high_risk_tickers": high_risk,
         }
 
-    def _compact_top_articles(
-        self,
-        articles: Any,
-    ) -> List[Dict[str, Any]]:
-        if not isinstance(articles, list):
-            return []
-
-        out = []
-
-        for article in articles[:3]:
-            if isinstance(article, dict):
-                out.append({
-                    "title": article.get("title") or article.get("headline"),
-                    "source": article.get("source"),
-                    "published_at": article.get("published_at") or article.get("date"),
-                    "url": article.get("url"),
-                })
-            else:
-                out.append({
-                    "title": str(article)[:200],
-                })
-
-        return out
-
     # =========================================================
-    # LLM generation: Gemini -> OpenAI -> fallback
+    # LLM generation
     # =========================================================
 
     def _generate_market_flow(
@@ -754,7 +903,6 @@ class MarketFlowAgent(BaseAgent):
         gemini_error = None
         openai_error = None
 
-        # 1) Gemini first
         try:
             result = self._generate_market_flow_with_gemini(
                 snapshot=snapshot,
@@ -771,7 +919,6 @@ class MarketFlowAgent(BaseAgent):
                 f"[MarketFlowAgent] Gemini failed. Trying OpenAI next. Error: {gemini_error}"
             )
 
-        # 2) OpenAI fallback
         try:
             result = self._generate_market_flow_with_openai(
                 snapshot=snapshot,
@@ -789,7 +936,6 @@ class MarketFlowAgent(BaseAgent):
                 f"[MarketFlowAgent] OpenAI failed. Using deterministic fallback. Error: {openai_error}"
             )
 
-        # 3) deterministic fallback
         return self._fallback_market_flow(
             snapshot=snapshot,
             error=f"Gemini failed: {gemini_error} | OpenAI failed: {openai_error}",
@@ -943,6 +1089,13 @@ class MarketFlowAgent(BaseAgent):
 - 특정 종목 매수/매도 권유처럼 쓰지 마세요.
 - 보고서 제목의 방향은 "시장 흐름 기반 유망 종목 후보 리포트"입니다.
 - 출력은 반드시 JSON만 반환하세요.
+- 입력 데이터는 전체 주식시장이 아니라 분석 대상 종목 유니버스일 수 있습니다.
+- 따라서 "시장 전체", "전체 시장"이라는 표현은 가급적 피하고, "분석 대상 종목", "분석 대상 유니버스", "분석 대상 종목군"이라고 표현하세요.
+- 이 리포트의 기준일은 입력 스냅샷의 as_of_date이며, 이는 OHLCV 최신일을 기준으로 합니다.
+- 외국인 수급 데이터는 파일의 date 컬럼이 아니라 OHLCV 기준일에 맞춘 데이터로 간주하세요.
+- 뉴스는 기준일 이하의 기사만 사용된 것으로 간주하세요.
+- agent 결과의 original_as_of_date가 기준일보다 늦더라도, 그것은 실행일일 수 있으므로 기준일 자체로 표현하지 마세요.
+- 기준일이 다른 보조 데이터가 있으면 limitations에 간단히 언급하세요.
 
 출력 JSON 스키마:
 {{
@@ -953,7 +1106,7 @@ class MarketFlowAgent(BaseAgent):
   "core_market_drivers": [
     {{
       "driver": "핵심 시장 동인",
-      "direction": "positive | negative | neutral",
+      "direction": "positive | negative | neutral | mixed",
       "evidence": "입력 데이터 기반 근거",
       "beginner_explanation": "초보 투자자용 쉬운 설명"
     }}
@@ -981,15 +1134,9 @@ class MarketFlowAgent(BaseAgent):
             "type": "object",
             "additionalProperties": False,
             "properties": {
-                "as_of_date": {
-                    "type": "string",
-                },
-                "market_one_line_summary": {
-                    "type": "string",
-                },
-                "market_brief": {
-                    "type": "string",
-                },
+                "as_of_date": {"type": "string"},
+                "market_one_line_summary": {"type": "string"},
+                "market_brief": {"type": "string"},
                 "market_keywords": {
                     "type": "array",
                     "items": {"type": "string"},
@@ -1003,7 +1150,7 @@ class MarketFlowAgent(BaseAgent):
                             "driver": {"type": "string"},
                             "direction": {
                                 "type": "string",
-                                "enum": ["positive", "negative", "neutral"],
+                                "enum": ["positive", "negative", "neutral", "mixed"],
                             },
                             "evidence": {"type": "string"},
                             "beginner_explanation": {"type": "string"},
@@ -1052,11 +1199,7 @@ class MarketFlowAgent(BaseAgent):
                         "body": {"type": "string"},
                         "source_note": {"type": "string"},
                     },
-                    "required": [
-                        "title",
-                        "body",
-                        "source_note",
-                    ],
+                    "required": ["title", "body", "source_note"],
                 },
                 "limitations": {
                     "type": "array",
@@ -1127,6 +1270,7 @@ class MarketFlowAgent(BaseAgent):
         hints = obj.get("candidate_scoring_hints")
         if not isinstance(hints, dict):
             hints = {}
+
         for k in [
             "positive_signals",
             "negative_signals",
@@ -1135,6 +1279,7 @@ class MarketFlowAgent(BaseAgent):
         ]:
             if k not in hints or not isinstance(hints[k], list):
                 hints[k] = []
+
         obj["candidate_scoring_hints"] = hints
 
         if not isinstance(obj.get("market_keywords"), list):
@@ -1143,16 +1288,62 @@ class MarketFlowAgent(BaseAgent):
         if not isinstance(obj.get("core_market_drivers"), list):
             obj["core_market_drivers"] = []
 
+        allowed_directions = {"positive", "negative", "neutral", "mixed"}
+
+        for item in obj.get("core_market_drivers", []):
+            if not isinstance(item, dict):
+                continue
+
+            direction = str(item.get("direction", "")).lower().strip()
+
+            if direction in allowed_directions:
+                item["direction"] = direction
+            elif direction in {"bullish", "up", "상승", "긍정", "positive_signal"}:
+                item["direction"] = "positive"
+            elif direction in {"bearish", "down", "하락", "부정", "negative_signal"}:
+                item["direction"] = "negative"
+            elif direction in {"mixed_market", "혼재", "혼재 국면"}:
+                item["direction"] = "mixed"
+            else:
+                item["direction"] = "neutral"
+
         if not isinstance(obj.get("limitations"), list):
             obj["limitations"] = []
 
         box = obj.get("report_summary_box")
         if not isinstance(box, dict):
             box = {}
+
         box.setdefault("title", "오늘 시장 한 줄 요약")
         box.setdefault("body", obj.get("market_one_line_summary", ""))
         box.setdefault("source_note", "뉴스, 시세 데이터 기반 추출")
         obj["report_summary_box"] = box
+
+        for key in ["market_one_line_summary", "market_brief"]:
+            obj[key] = self._sanitize_market_scope_text(obj.get(key, ""))
+
+        for item in obj.get("core_market_drivers", []):
+            if not isinstance(item, dict):
+                continue
+
+            for key in ["driver", "evidence", "beginner_explanation"]:
+                item[key] = self._sanitize_market_scope_text(item.get(key, ""))
+
+        box = obj.get("report_summary_box", {})
+        if isinstance(box, dict):
+            for key in ["title", "body", "source_note"]:
+                box[key] = self._sanitize_market_scope_text(box.get(key, ""))
+            obj["report_summary_box"] = box
+
+        obj["market_keywords"] = [
+            self._sanitize_market_scope_text(x)
+            for x in obj.get("market_keywords", [])
+        ]
+
+        obj["limitations"] = [
+            self._sanitize_market_scope_text(x)
+            for x in obj.get("limitations", [])
+        ]
 
         return obj
 
@@ -1194,7 +1385,7 @@ class MarketFlowAgent(BaseAgent):
             preferred_themes.append("외국인 순매수 상위 종목군")
 
         brief_parts = [
-            f"시장 분석 결과, 현재 시장은 '{market_phase}'으로 분류됩니다."
+            f"분석 대상 유니버스는 '{market_phase}'으로 분류됩니다."
         ]
 
         if market_summary:
@@ -1220,15 +1411,13 @@ class MarketFlowAgent(BaseAgent):
 
         market_brief = " ".join(brief_parts)
 
-        if market_tone == "positive":
-            direction = "positive"
-        elif market_tone == "negative":
-            direction = "negative"
+        if market_tone in {"positive", "negative", "neutral", "mixed"}:
+            direction = market_tone
         else:
             direction = "neutral"
 
         summary_body = (
-            f"시장 분석 결과, 현재 시장은 {market_phase}으로 나타났고 "
+            f"분석 대상 종목군은 {market_phase}으로 나타났고 "
             "종목별 차별화와 리스크 점검이 중요한 흐름입니다."
         )
 
@@ -1249,7 +1438,7 @@ class MarketFlowAgent(BaseAgent):
                     "direction": direction,
                     "evidence": market_summary or "Market Analysis Agent의 시장 국면 결과 기반",
                     "beginner_explanation": (
-                        "시장 전체가 한 방향으로만 움직이기보다는, "
+                        "분석 대상 종목들이 한 방향으로만 움직이기보다는, "
                         "종목마다 상승과 하락이 다르게 나타나는 상태예요."
                     ),
                 },
@@ -1260,6 +1449,15 @@ class MarketFlowAgent(BaseAgent):
                     "beginner_explanation": (
                         "뉴스가 많이 나오거나 중요한 이슈가 있는 종목은 "
                         "단기적으로 투자자 관심이 커질 수 있어요."
+                    ),
+                },
+                {
+                    "driver": "외국인 수급 차별화",
+                    "direction": "mixed",
+                    "evidence": f"외국인 순매수 상위 종목 수: {len(top_foreign_buy)}",
+                    "beginner_explanation": (
+                        "외국인 투자자가 많이 산 종목은 수급 관심이 있는 종목으로 볼 수 있지만, "
+                        "그 자체가 매수 신호는 아니므로 다른 지표와 함께 봐야 해요."
                     ),
                 },
                 {
@@ -1311,7 +1509,7 @@ class MarketFlowAgent(BaseAgent):
         }
 
     # =========================================================
-    # Markdown output
+    # Output helpers
     # =========================================================
 
     def _save_markdown(self, result: Dict[str, Any], path: Path) -> None:
@@ -1477,6 +1675,80 @@ class MarketFlowAgent(BaseAgent):
 
         return str(dates.max().date())
 
+    def _parse_date_or_none(self, value: Any) -> Optional[pd.Timestamp]:
+        if value is None:
+            return None
+
+        try:
+            ts = pd.to_datetime(value, errors="coerce")
+            if pd.isna(ts):
+                return None
+            return ts.normalize()
+        except Exception:
+            return None
+
+    def _filter_articles_until_date(
+        self,
+        articles: Any,
+        target_date: Optional[str],
+    ) -> List[Dict[str, Any]]:
+        if not isinstance(articles, list):
+            return []
+
+        target_ts = self._parse_date_or_none(target_date)
+        if target_ts is None:
+            return [
+                a for a in articles
+                if isinstance(a, dict)
+            ]
+
+        filtered = []
+
+        for article in articles:
+            if not isinstance(article, dict):
+                continue
+
+            value = (
+                article.get("published_at")
+                or article.get("pubDate")
+                or article.get("date")
+                or article.get("datetime")
+            )
+
+            article_ts = self._parse_date_or_none(value)
+
+            # 날짜가 없으면 버리지 않는다. 다만 source caveat는 news_overview에 남김.
+            if article_ts is None:
+                filtered.append(article)
+            elif article_ts <= target_ts:
+                filtered.append(article)
+
+        return filtered
+
+    def _compact_top_articles(
+        self,
+        articles: Any,
+    ) -> List[Dict[str, Any]]:
+        if not isinstance(articles, list):
+            return []
+
+        out = []
+
+        for article in articles[:3]:
+            if isinstance(article, dict):
+                out.append({
+                    "title": article.get("title") or article.get("headline"),
+                    "source": article.get("source"),
+                    "published_at": article.get("published_at") or article.get("pubDate") or article.get("date"),
+                    "url": article.get("url"),
+                })
+            else:
+                out.append({
+                    "title": str(article)[:200],
+                })
+
+        return out
+
     @staticmethod
     def _safe_float(x: Any) -> Optional[float]:
         try:
@@ -1529,6 +1801,22 @@ class MarketFlowAgent(BaseAgent):
             pass
 
         return obj
+
+    def _sanitize_market_scope_text(self, text: Any) -> Any:
+        if not isinstance(text, str):
+            return text
+
+        replacements = {
+            "시장 전체": "분석 대상 종목군",
+            "전체 시장": "분석 대상 유니버스",
+            "시장 전반": "분석 대상 종목군",
+            "대부분의 시장": "분석 대상 종목 대부분",
+        }
+
+        for old, new in replacements.items():
+            text = text.replace(old, new)
+
+        return text
 
     @staticmethod
     def _is_retryable_error(err_msg: str) -> bool:
