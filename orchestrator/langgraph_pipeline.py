@@ -16,7 +16,7 @@ from agents.market_analysis.agent import MarketAnalysisAgent
 from agents.news_invest.agent import NewsInvestigationAgent
 from agents.risk_score.agent import RiskScoreAgent
 from agents.market_flow.agent import MarketFlowAgent
-from agents.model_match_v2.agent import ModelTargetMatcherAgent
+from agents.report_target_planner.agent import ReportTargetPlannerAgent
 from agents.model_infer.agent import ModelInferenceAgent
 from agents.report_gen.agent import ReportGenerativeAgent
 
@@ -114,6 +114,9 @@ def run_risk_score(state: PipelineState) -> PipelineState:
     agent = RiskScoreAgent()
     return _run_stage(state, "risk_score", agent)
 
+def run_report_target_planner(state: PipelineState) -> PipelineState:
+    agent = ReportTargetPlannerAgent()
+    return _run_stage(state, "report_target_planner", agent)
 def run_market_flow(state: PipelineState) -> PipelineState:
     agent = MarketFlowAgent()
     return _run_stage(state, "market_flow", agent)
@@ -140,6 +143,9 @@ def build_pipeline():
     graph.add_node("market_analysis", run_market_analysis)
     graph.add_node("news_invest", run_news_invest)
     graph.add_node("risk_score", run_risk_score)
+    graph.add_node("report_target_planner", run_report_target_planner)
+    graph.add_node("model_infer", run_model_infer)
+    graph.add_node("report_gen", run_report_gen)
     graph.add_node("market_flow", run_market_flow)
     # graph.add_node("model_match_v2", run_model_match_v2)
     # graph.add_node("model_infer", run_model_infer)
@@ -153,6 +159,10 @@ def build_pipeline():
     graph.add_edge("prep_apply", "market_analysis")
     graph.add_edge("market_analysis", "news_invest")
     graph.add_edge("news_invest", "risk_score")
+    graph.add_edge("risk_score", "report_target_planner")
+    graph.add_edge("report_target_planner", "model_infer")
+    graph.add_edge("model_infer", "report_gen")
+    graph.add_edge("report_gen", END)
     graph.add_edge("risk_score", "market_flow")
     # graph.add_edge("risk_score", "model_match_v2")
     # graph.add_edge("model_match_v2", "model_infer")
