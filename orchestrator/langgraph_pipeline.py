@@ -18,6 +18,7 @@ from agents.risk_score.agent import RiskScoreAgent
 from agents.market_flow.agent import MarketFlowAgent
 from agents.report_target_planner.agent import ReportTargetPlannerAgent
 from agents.candidate_score.agent import CandidateScoringAgent
+from agents.report_evidence_builder.agent import ReportEvidenceBuilderAgent
 
 
 class PipelineState(TypedDict, total=False):
@@ -125,6 +126,10 @@ def run_candidate_score(state: PipelineState) -> PipelineState:
     agent = CandidateScoringAgent()
     return _run_stage(state, "candidate_score", agent)
 
+def run_report_evidence_builder(state: PipelineState) -> PipelineState:
+    agent = ReportEvidenceBuilderAgent()
+    return _run_stage(state, "report_evidence_builder", agent)
+
 # def run_model_match_v2(state: PipelineState) -> PipelineState:
 #     agent = ModelTargetMatcherAgent()
 #     return _run_stage(state, "model_match_v2", agent)
@@ -150,7 +155,8 @@ def build_pipeline():
     graph.add_node("report_target_planner", run_report_target_planner)
     graph.add_node("market_flow", run_market_flow)
     graph.add_node("candidate_score", run_candidate_score)
-    
+    graph.add_node("report_evidence_builder", run_report_evidence_builder)
+
     graph.set_entry_point("ingest")
     graph.add_edge("ingest", "feature_table")
     graph.add_edge("feature_table", "prep_reco")
@@ -162,6 +168,7 @@ def build_pipeline():
     graph.add_edge("risk_score", "report_target_planner")
     graph.add_edge("report_target_planner", "market_flow")
     graph.add_edge("market_flow", "candidate_score")
-    graph.add_edge("candidate_score", END)
+    graph.add_edge("candidate_score", "report_evidence_builder")
+    graph.add_edge("report_evidence_builder", END)
 
     return graph.compile()
