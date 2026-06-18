@@ -19,6 +19,7 @@ from agents.market_flow.agent import MarketFlowAgent
 from agents.report_target_planner.agent import ReportTargetPlannerAgent
 from agents.candidate_score.agent import CandidateScoringAgent
 from agents.report_evidence_builder.agent import ReportEvidenceBuilderAgent
+from agents.report_gen.agent import ReportGenerativeAgent
 
 
 class PipelineState(TypedDict, total=False):
@@ -130,17 +131,9 @@ def run_report_evidence_builder(state: PipelineState) -> PipelineState:
     agent = ReportEvidenceBuilderAgent()
     return _run_stage(state, "report_evidence_builder", agent)
 
-# def run_model_match_v2(state: PipelineState) -> PipelineState:
-#     agent = ModelTargetMatcherAgent()
-#     return _run_stage(state, "model_match_v2", agent)
-
-# def run_model_infer(state: PipelineState) -> PipelineState:
-#     agent = ModelInferenceAgent()
-#     return _run_stage(state, "model_infer", agent)
-
-# def run_report_gen(state: PipelineState) -> PipelineState:
-#     agent = ReportGenerativeAgent()
-#     return _run_stage(state, "report_gen", agent)
+def run_report_gen(state: PipelineState) -> PipelineState:
+    agent = ReportGenerativeAgent()
+    return _run_stage(state, "report_gen", agent)
 
 def build_pipeline():
     graph = StateGraph(PipelineState)
@@ -156,6 +149,7 @@ def build_pipeline():
     graph.add_node("market_flow", run_market_flow)
     graph.add_node("candidate_score", run_candidate_score)
     graph.add_node("report_evidence_builder", run_report_evidence_builder)
+    graph.add_node("report_gen", run_report_gen)
 
     graph.set_entry_point("ingest")
     graph.add_edge("ingest", "feature_table")
@@ -169,6 +163,7 @@ def build_pipeline():
     graph.add_edge("report_target_planner", "market_flow")
     graph.add_edge("market_flow", "candidate_score")
     graph.add_edge("candidate_score", "report_evidence_builder")
-    graph.add_edge("report_evidence_builder", END)
+    graph.add_edge("report_evidence_builder", "report_gen")
+    graph.add_edge("report_gen", END)
 
     return graph.compile()

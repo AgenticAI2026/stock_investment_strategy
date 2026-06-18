@@ -1,14 +1,15 @@
 from __future__ import annotations
 
+import copy
 import inspect
 import json
-import math
-from dataclasses import dataclass
+import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-import pandas as pd
+from dotenv import load_dotenv
 
 from core.agent_base import BaseAgent
 from core.result import StageResult
@@ -16,937 +17,1407 @@ from core.context import RunContext
 from core.artifacts import ArtifactPaths
 
 
-# ── 수준 레이블 ────────────────────────────────────────────────────────────────
-LEVEL_LABELS = {
-    "beginner":  "초보",
-    "intermediate": "중급",
-    "advanced":  "고급",
-}
-
-TERM_GLOSSARY = {
-    "SpearmanRankIC": "종목 순위 예측 정확도(Spearman IC)",
-    "NDCG@10":        "상위 10개 종목 선별 품질(NDCG@10)",
-    "AUC":            "하락 예측 정확도(AUC)",
-    "F1":             "하락 감지 균형 성능(F1)",
-    "pred_rank_score_20d":      "20일 후 예상 순위 점수",
-    "pred_rank_percentile_20d": "20일 후 상위 몇 % 예측",
-    "proba_top_quantile_20d":   "상위 20% 진입 확률",
-    "proba_downside_20d":       "20일 내 하락 확률",
-    "blend_score":              "종합 투자 매력도",
-}
-
-RISK_LEVEL_LABEL = {
-    "low":      "낮음",
-    "medium":   "중간",
-    "high":     "높음",
-    "critical": "매우 높음",
-}
-
-RISK_LEVEL_ICON = {
-    "low":      "🟢",
-    "medium":   "🟡",
-    "high":     "🔴",
-    "critical": "🚨",
-}
-
-
-@dataclass
-class ReportArtifacts:
-    run_dir: Path
-    output_dir: Path
-    report_json_path: Path
-    report_md_path: Path
-    manifest_path: Path
-    output_files: List[str]
-
-
 class ReportGenerativeAgent(BaseAgent):
-    stage = "report_gen"
-    version = "1.3-survey-enhanced"
+    stage = "report_generation"
+    version = "1.0.0"
 
-    def __init__(self, encoding: str = "utf-8"):
+    COMPONENT_LABELS = {
+        "market_flow_alignment_score": "시장 흐름 연관도",
+        "news_direct_relevance_score": "뉴스 직접 관련도",
+        "news_momentum_score": "뉴스 모멘텀",
+        "price_volume_momentum_score": "가격·거래량 모멘텀",
+        "foreign_flow_score": "외국인 수급",
+        "fundamental_score": "재무 지표",
+        "risk_penalty_score": "리스크 부담",
+        "user_interest_boost": "사용자 관심 반영",
+    }
+
+    def __init__(
+        self,
+        gemini_model_name: str = "gemini-2.5-flash",
+        openai_model_name: str = "gpt-4.1-mini",
+        llm_provider: str = "auto",
+        use_llm: bool = True,
+        encoding: str = "utf-8",
+        max_news_per_candidate: int = 3,
+        model_name: Optional[str] = None,
+    ):
+        if model_name is not None:
+            gemini_model_name = model_name
+
+        self.gemini_model_name = gemini_model_name
+        self.openai_model_name = openai_model_name
+        self.llm_provider = llm_provider
+        self.use_llm = use_llm
         self.encoding = encoding
+        self.max_news_per_candidate = max_news_per_candidate
 
     def execute(self, ctx: RunContext, ap: ArtifactPaths) -> StageResult:
         return self.run(ctx, ap)
 
-    # ═══════════════════════════════════════════════════════════════════════════
-    # [수정 1] run() — user_id / user_level 파라미터 추가
-    # ═══════════════════════════════════════════════════════════════════════════
-    def run(
-        self,
-        ctx: RunContext,
-        ap: ArtifactPaths,
-        user_id: Optional[str] = None,
-        user_level: str = "beginner",   # "beginner" | "intermediate" | "advanced"
-    ) -> StageResult:
-        """
-        Parameters
-        ----------
-        user_id : str, optional
-            personalized_scores.csv 에서 사용할 사용자 ID (예: "U001").
-            None 이면 전체 평균으로 fallback.
-        user_level : str
-            "beginner" / "intermediate" / "advanced" — 설문 결과 반영:
-            초보(81% 응답자) 는 용어 설명 병기, 핵심 요약 우선 표시.
-        """
+    def run(self, ctx: RunContext, ap: ArtifactPaths) -> StageResult:
+        load_dotenv()
+
         run_dir = Path(ctx.artifact_root)
         output_dir = run_dir / self.stage
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        artifacts = ReportArtifacts(
-            run_dir=run_dir,
-            output_dir=output_dir,
-            report_json_path=output_dir / "report_summary.json",
-            report_md_path=output_dir / "report.md",
-            manifest_path=output_dir / "manifest.json",
-            output_files=[],
+        result_path = output_dir / "report_output.json"
+        manifest_path = output_dir / "manifest.json"
+
+        ctx.logger.info("[ReportGenerativeAgent] Starting report generation.")
+
+        evidence_path = self._find_single_file(
+            run_dir,
+            "report_evidence_result.json",
+            ctx,
         )
 
-        paths = {
-            "metrics":            self._find_exact_file(run_dir, "model_infer_metrics.json"),
-            "predictions":        self._find_exact_file(run_dir, "model_infer_predictions_20d.csv"),
-            "feature_importance": self._find_exact_file(run_dir, "model_infer_feature_importance.json"),
-            "personalized_scores":self._find_exact_file(run_dir, "model_infer_personalized_scores.csv"),
-            "model_infer_manifest":self._find_exact_file(run_dir, "manifest.json", preferred_parent="model_infer"),
-            "risk_json":          self._find_exact_file(run_dir, "risk_score_result.json"),
-            "market_json":        self._find_exact_file(run_dir, "market_analysis_result.json"),
-            "news_json":          self._find_exact_file(run_dir, "news_invest_rag_result.json"),
-        }
-
-        required = ["metrics", "predictions", "feature_importance", "personalized_scores"]
-        missing = [k for k in required if paths[k] is None]
-        if missing:
-            raise FileNotFoundError(f"Missing required report inputs: {missing}")
-
-        metrics           = self._read_json(paths["metrics"])
-        feature_importance= self._read_json(paths["feature_importance"])
-        pred              = pd.read_csv(paths["predictions"], encoding=self.encoding)
-        personalized      = pd.read_csv(paths["personalized_scores"], encoding=self.encoding)
-
-        self._normalize_ticker_date(pred)
-        self._normalize_ticker_date(personalized)
-
-        selected_models = metrics.get("selected_models") or {}
-        rank_model      = selected_models.get("rank_20d")
-        rank_pct_model  = selected_models.get("rank_percentile_20d")
-        topq_model      = selected_models.get("top_quantile_20d")
-        downside_model  = selected_models.get("downside_20d")
-
-        pred_rank_col = self._resolve_col(
-            pred,
-            [f"pred_rank_score_20d__{rank_model}" if rank_model else None,
-             f"pred_rank_20d__{rank_model}" if rank_model else None],
-            prefixes=["pred_rank_score_20d__", "pred_rank_20d__", "pred_rank__"],
-            fallback_contains=["rank"],
-        )
-        pred_rank_pct_col = self._resolve_col(
-            pred,
-            [f"pred_rank_percentile_20d__{rank_pct_model}" if rank_pct_model else None,
-             f"pred_rank_pct_20d__{rank_pct_model}" if rank_pct_model else None],
-            prefixes=["pred_rank_percentile_20d__", "pred_rank_pct_20d__"],
-            fallback_contains=["percentile"],
-            required=False,
-        )
-        topq_col = self._resolve_col(
-            pred,
-            [f"proba_top_quantile_20d__{topq_model}" if topq_model else None,
-             f"pred_top_quantile_20d__{topq_model}" if topq_model else None],
-            prefixes=["proba_top_quantile_20d__", "pred_top_quantile_20d__", "proba_top_quantile__"],
-            fallback_contains=["top_quantile"],
-            required=False,
-        )
-        downside_col = self._resolve_col(
-            pred,
-            [f"proba_downside_20d__{downside_model}" if downside_model else None,
-             f"pred_downside_20d__{downside_model}" if downside_model else None],
-            prefixes=["proba_downside_20d__", "pred_downside_20d__", "proba_downside__"],
-            fallback_contains=["downside"],
-        )
-
-        date_col    = "date" if "date" in pred.columns else None
-        latest_date = pd.to_datetime(pred[date_col]).max() if date_col else None
-
-        if date_col:
-            latest_pred = pred[pd.to_datetime(pred[date_col]) == latest_date].copy()
-        else:
-            latest_pred = pred.copy()
-
-        latest_pred["pred_rank_score_20d"] = pd.to_numeric(latest_pred[pred_rank_col], errors="coerce")
-
-        if pred_rank_pct_col:
-            latest_pred["pred_rank_percentile_20d"] = pd.to_numeric(latest_pred[pred_rank_pct_col], errors="coerce")
-        else:
-            latest_pred["pred_rank_percentile_20d"] = None
-
-        if topq_col:
-            latest_pred["proba_top_quantile_20d"] = pd.to_numeric(latest_pred[topq_col], errors="coerce")
-        else:
-            latest_pred["proba_top_quantile_20d"] = None
-
-        latest_pred["proba_downside_20d"] = pd.to_numeric(latest_pred[downside_col], errors="coerce")
-
-        # ── [수정 1] 개인화 점수: user_id 있으면 해당 user만, 없으면 전체 평균 ──
-        score_col = self._resolve_col(
-            personalized,
-            ["personalized_ranking_score", "personalized_score"],
-            prefixes=["personalized_ranking_score", "personalized_score"],
-            fallback_contains=["personalized"],
-            required=False,
-        )
-
-        if score_col:
-            if "as_of_date" in personalized.columns:
-                personalized["as_of_date"] = pd.to_datetime(personalized["as_of_date"], errors="coerce")
-                personalized_last = personalized[
-                    personalized["as_of_date"] == personalized["as_of_date"].max()
-                ].copy()
-            else:
-                personalized_last = personalized.copy()
-
-            # user_id 필터링
-            if user_id and "user_id" in personalized_last.columns:
-                user_subset = personalized_last[personalized_last["user_id"] == user_id]
-                if user_subset.empty:
-                    print(f"[WARN] user_id={user_id} not found. falling back to all-user average.")
-                    user_subset = personalized_last
-            else:
-                user_subset = personalized_last
-
-            pers_agg = (
-                user_subset.groupby("ticker", as_index=False)[score_col]
-                .mean()
-                .rename(columns={score_col: "personalized_score_avg"})
+        if evidence_path is None:
+            raise FileNotFoundError(
+                "[ReportGenerativeAgent] report_evidence_result.json을 찾을 수 없습니다."
             )
-            latest_pred = latest_pred.merge(pers_agg, on="ticker", how="left")
-        else:
-            latest_pred["personalized_score_avg"] = None
 
-        risk_map   = self._load_optional_ticker_map(paths["risk_json"])
-        market_map = self._load_optional_ticker_map(paths["market_json"],
-                                                    list_key="ticker_analyses")
-        news_map   = self._load_optional_ticker_map(paths["news_json"])
+        evidence_manifest_path = evidence_path.parent / "manifest.json"
+        if not evidence_manifest_path.exists():
+            evidence_manifest_path = None
 
-        risk_level_counts = None
-        if paths["risk_json"] is not None:
-            risk_json = self._read_json(paths["risk_json"])
-            risk_level_counts = (risk_json.get("universe_summary") or {}).get("risk_level_counts")
-
-        # ── [수정 1] blend_score: 개인화 점수를 가중치로 반영 ──
-        pers_w = 0.20 if (score_col and user_id) else 0.0
-        rank_w = 1.0 - pers_w
-
-        latest_pred["blend_score"] = (
-            rank_w * latest_pred["pred_rank_score_20d"].fillna(0)
-            + 0.30  * latest_pred["proba_top_quantile_20d"].fillna(0)
-            - 0.50  * latest_pred["proba_downside_20d"].fillna(0)
-            + pers_w * latest_pred["personalized_score_avg"].fillna(0)
+        report_output_contract_path = self._find_single_file(
+            run_dir,
+            "report_output_contract.json",
+            ctx,
         )
 
-        if risk_map:
-            latest_pred["risk_level"] = latest_pred["ticker"].map(
-                lambda t: (risk_map.get(t, {}).get("risk_scores") or {}).get("risk_level")
+        evidence = self._safe_read_json(evidence_path, ctx)
+        evidence_manifest = self._safe_read_json(evidence_manifest_path, ctx)
+        report_output_contract = self._safe_read_json(report_output_contract_path, ctx)
+
+        if not evidence:
+            raise ValueError(
+                "[ReportGenerativeAgent] report_evidence_result.json이 비어 있거나 읽을 수 없습니다."
             )
-            latest_pred = latest_pred[
-                latest_pred["risk_level"].fillna("unknown").astype(str).str.lower().ne("critical")
-            ].copy()
 
-        top5 = (
-            latest_pred.sort_values("blend_score", ascending=False)
-            .head(5)
-            .reset_index(drop=True)
+        llm_pack, llm_status = self._generate_text_pack(
+            evidence=evidence,
+            ctx=ctx,
         )
 
-        # ── [수정 5] market_overview 로드 ──
-        market_overview = None
-        if paths["market_json"] is not None:
-            raw_market = self._read_json(paths["market_json"])
-            market_overview = raw_market.get("market_overview")
+        if llm_pack is None:
+            llm_pack = {}
 
-        report = {
-            "meta": {
-                "agent":          self.__class__.__name__,
-                "stage":          self.stage,
-                "version":        self.version,
-                "created_at_utc": self._now_utc(),
-                "inputs":         {k: str(v) if v is not None else None for k, v in paths.items()},
-                "as_of_date":     str(pd.to_datetime(latest_date).date()) if pd.notna(latest_date) else None,
-                "selected_models":selected_models,
-                "user_id":        user_id,
-                "user_level":     user_level,
-                "prediction_columns": {
-                    "rank":           pred_rank_col,
-                    "rank_percentile":pred_rank_pct_col,
-                    "top_quantile":   topq_col,
-                    "downside":       downside_col,
-                },
-            },
-            "performance":              self._build_performance_summary(metrics, selected_models),
-            "feature_importance_top10": self._build_feature_importance_summary(feature_importance, selected_models),
-            "risk_universe_summary":    {"risk_level_counts": risk_level_counts},
-            "market_overview":          market_overview,   # [수정 5]
-            "recommendations_top5":     [],
+        report = self._build_report_output(
+            evidence=evidence,
+            evidence_path=evidence_path,
+            evidence_manifest=evidence_manifest,
+            evidence_manifest_path=evidence_manifest_path,
+            report_output_contract=report_output_contract,
+            report_output_contract_path=report_output_contract_path,
+            llm_pack=llm_pack,
+            llm_status=llm_status,
+            ctx=ctx,
+        )
+
+        is_valid, warnings = self._validate_report_output(report)
+
+        report["quality_checks"] = {
+            "is_valid": is_valid,
+            "warnings": warnings,
         }
 
-        for _, row in top5.iterrows():
-            ticker = row["ticker"]
-            item = {
-                "ticker":                  ticker,
-                "as_of_date":              str(pd.to_datetime(row[date_col]).date())
-                                           if date_col and pd.notna(row.get(date_col))
-                                           else report["meta"]["as_of_date"],
-                "pred_rank_score_20d":     self._safe_float(row.get("pred_rank_score_20d")),
-                "pred_rank_percentile_20d":self._safe_float(row.get("pred_rank_percentile_20d")),
-                "proba_top_quantile_20d":  self._safe_float(row.get("proba_top_quantile_20d")),
-                "proba_downside_20d":      self._safe_float(row.get("proba_downside_20d")),
-                "personalized_score_avg":  self._safe_float(row.get("personalized_score_avg")),
-                "blend_score":             self._safe_float(row.get("blend_score")),
-                "risk":                    self._get_risk_brief(ticker, risk_map) if risk_map else None,
-                "market_brief":            self._get_market_brief(ticker, market_map) if market_map else None,  # [수정 2]
-                "news_brief":              self._get_news_brief(ticker, news_map) if news_map else None,        # [수정 3]
-            }
-            report["recommendations_top5"].append(item)
+        self._save_json(report, result_path)
 
-        self._save_json(report, artifacts.report_json_path)
+        manifest = self._build_manifest(
+            evidence_path=evidence_path,
+            evidence_manifest_path=evidence_manifest_path,
+            report_output_contract_path=report_output_contract_path,
+            result_path=result_path,
+            report=report,
+            is_valid=is_valid,
+            warnings=warnings,
+            llm_status=llm_status,
+        )
 
-        md = self._build_markdown_report(report, user_level=user_level)
-        artifacts.report_md_path.write_text(md, encoding="utf-8")
+        self._save_json(manifest, manifest_path)
 
-        artifacts.output_files = [
-            str(artifacts.report_json_path),
-            str(artifacts.report_md_path),
-            str(artifacts.manifest_path),
-        ]
-
-        manifest = {
-            "stage":           self.stage,
-            "version":         self.version,
-            "created_at_utc":  self._now_utc(),
-            "input_files":     {k: str(v) if v is not None else None for k, v in paths.items()},
-            "output_files":    artifacts.output_files,
-            "as_of_date":      report["meta"]["as_of_date"],
-            "user_id":         user_id,
-            "user_level":      user_level,
-            "top5_tickers":    [x["ticker"] for x in report["recommendations_top5"]],
+        metrics = {
+            "is_valid": is_valid,
+            "n_warnings": len(warnings),
+            "n_candidates": len(
+                self._safe_get(report, "candidate_section.candidates", default=[])
+            ),
+            "as_of_date": self._safe_get(report, "report_meta.as_of_date"),
+            "llm_used": llm_status.get("used"),
+            "llm_provider": llm_status.get("provider"),
         }
 
-        self._save_json(manifest, artifacts.manifest_path)
+        outputs = {
+            "output_dir": str(output_dir),
+            "report_output": str(result_path),
+            "manifest": str(manifest_path),
+        }
+
+        if warnings:
+            for warning in warnings:
+                ctx.logger.warning(f"[ReportGenerativeAgent] {warning}")
+
+        ctx.logger.info("[ReportGenerativeAgent] Completed report generation.")
 
         return self._make_stage_result(
             status="success",
             message="Report generation completed.",
-            metrics={
-                "top5_count":       len(report["recommendations_top5"]),
-                "has_market_json":  paths["market_json"] is not None,
-                "has_news_json":    paths["news_json"] is not None,
-                "has_risk_json":    paths["risk_json"] is not None,
-                "user_id":          user_id,
-                "user_level":       user_level,
-            },
-            outputs={
-                "output_dir":    str(output_dir),
-                "report_summary":str(artifacts.report_json_path),
-                "report_md":     str(artifacts.report_md_path),
-                "manifest":      str(artifacts.manifest_path),
-            },
+            metrics=metrics,
+            outputs=outputs,
         )
 
-    # ═══════════════════════════════════════════════════════════════════════════
-    # File helpers (기존 유지)
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ============================================================
+    # Report builder
+    # ============================================================
 
-    def _find_exact_file(
+    def _build_report_output(
+        self,
+        evidence: Dict[str, Any],
+        evidence_path: Path,
+        evidence_manifest: Optional[Dict[str, Any]],
+        evidence_manifest_path: Optional[Path],
+        report_output_contract: Optional[Dict[str, Any]],
+        report_output_contract_path: Optional[Path],
+        llm_pack: Dict[str, Any],
+        llm_status: Dict[str, Any],
+        ctx: RunContext,
+    ) -> Dict[str, Any]:
+        report_context = evidence.get("report_context", {}) or {}
+        market_context = evidence.get("market_context", {}) or {}
+        top10 = evidence.get("top10_evidence", []) or []
+
+        as_of_date = (
+            evidence.get("as_of_date")
+            or market_context.get("as_of_date")
+            or self._safe_get(evidence_manifest, "summary.as_of_date")
+        )
+
+        report_title = self._first_non_empty(
+            report_context.get("report_title"),
+            default="시장 흐름 기반 유망 종목 후보 리포트",
+        )
+
+        llm_market_text = llm_pack.get("market_summary")
+        llm_candidates = llm_pack.get("candidates", {})
+
+        if not isinstance(llm_candidates, dict):
+            llm_candidates = {}
+
+        candidate_cards = []
+
+        for item in sorted(top10, key=lambda x: x.get("rank", 999)):
+            ticker = str(item.get("ticker", ""))
+
+            llm_candidate_text = llm_candidates.get(ticker)
+            if not isinstance(llm_candidate_text, dict):
+                llm_candidate_text = self._fallback_candidate_text(item)
+
+            candidate_cards.append(
+                self._build_candidate_card(
+                    item=item,
+                    llm_candidate_text=llm_candidate_text,
+                )
+            )
+
+        report = {
+            "meta": {
+                "agent": self.__class__.__name__,
+                "stage": self.stage,
+                "version": self.version,
+                "created_at_utc": self._now_utc(),
+                "purpose": "프론트엔드 카드형 UI 렌더링을 위한 최종 리포트 JSON 생성",
+                "llm_status": llm_status,
+            },
+            "report_meta": {
+                "report_type": report_context.get(
+                    "report_type",
+                    "market_flow_candidate_report",
+                ),
+                "title": report_title,
+                "subtitle": (
+                    "시장 상황을 먼저 요약하고, 그 흐름에 맞는 관심 종목 후보를 제시하는 "
+                    "초보 투자자용 리포트"
+                ),
+                "as_of_date": as_of_date,
+                "ranking_target": report_context.get("ranking_target"),
+                "ranking_scope": report_context.get("ranking_scope"),
+                "candidate_definition": report_context.get("candidate_definition", {}),
+            },
+            "ui_contract": {
+                "layout": "market_summary_then_candidate_cards_then_glossary",
+                "components": [
+                    "MarketSummaryCard",
+                    "CandidateStockCard",
+                    "StockPriceChart",
+                    "ActualDataTable",
+                    "NewsList",
+                    "EntryReasonBox",
+                    "GlossarySection",
+                ],
+                "frontend_notes": [
+                    "chart.series.price는 차트 렌더링에 사용합니다.",
+                    "actual_data.items는 표 형태로 표시합니다.",
+                    "top_news.url은 뉴스 링크 버튼에 연결합니다.",
+                    "is_missing=true인 데이터는 '-' 또는 '데이터 없음'으로 표시합니다.",
+                    "이 리포트는 투자 추천이 아니라 관심 후보 설명 리포트입니다.",
+                ],
+            },
+            "disclaimer": {
+                "short": (
+                    "본 리포트는 투자 추천이 아니라 시장 흐름 기반 관심 후보를 정리한 참고 자료입니다."
+                ),
+                "long": (
+                    "본 결과는 시세, 뉴스, 수급, 재무, 리스크 데이터를 기반으로 생성된 "
+                    "정보성 리포트입니다. 특정 종목의 매수·매도 추천, 수익률 예측, "
+                    "수익 보장을 의미하지 않습니다."
+                ),
+            },
+            "market_summary": self._build_market_summary(
+                evidence=evidence,
+                llm_market_text=llm_market_text,
+            ),
+            "candidate_section": {
+                "title": "유망 + 관심 종목 후보 TOP 10",
+                "subtitle": "오늘 시장 흐름과 데이터상 관심 있게 확인할 만한 종목 후보입니다.",
+                "candidate_count": len(candidate_cards),
+                "candidates": candidate_cards,
+            },
+            "glossary": {
+                "title": "용어 풀이",
+                "items": self._build_glossary(evidence),
+            },
+            "data_limitations": evidence.get("data_limitations", []),
+            "source_trace": {
+                "report_evidence_result": str(evidence_path),
+                "evidence_manifest": str(evidence_manifest_path) if evidence_manifest_path else None,
+                "report_output_contract": (
+                    str(report_output_contract_path) if report_output_contract_path else None
+                ),
+                "evidence_builder_manifest": evidence_manifest,
+                "report_output_contract_object": report_output_contract,
+            },
+        }
+
+        return report
+
+    def _build_market_summary(
+        self,
+        evidence: Dict[str, Any],
+        llm_market_text: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        market_context = evidence.get("market_context", {}) or {}
+        summary_box = market_context.get("report_summary_box", {}) or {}
+
+        if not isinstance(llm_market_text, dict):
+            llm_market_text = self._fallback_market_text(market_context)
+
+        return {
+            "title": summary_box.get("title", "오늘 시장 한 줄 요약"),
+            "headline": self._truncate_text(llm_market_text.get("headline"), 100),
+            "body": self._truncate_text(llm_market_text.get("body"), 180),
+            "source_note": summary_box.get(
+                "source_note",
+                "시세, 뉴스, 외국인 수급, 리스크 데이터 기반 추출",
+            ),
+            "market_phase": market_context.get("market_phase"),
+            "market_tone": market_context.get("market_tone"),
+            "market_tone_label": llm_market_text.get(
+                "tone_label",
+                self._tone_label_ko(market_context.get("market_tone")),
+            ),
+            "keywords": market_context.get("market_keywords", []),
+            "core_drivers": market_context.get("core_market_drivers", []),
+            "risk_notes": market_context.get("market_risk_notes", []),
+            "raw_market_brief": market_context.get("market_brief"),
+        }
+
+    def _build_candidate_card(
+        self,
+        item: Dict[str, Any],
+        llm_candidate_text: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        if not isinstance(llm_candidate_text, dict):
+            llm_candidate_text = self._fallback_candidate_text(item)
+
+        rank = item.get("rank")
+        score = item.get("market_flow_candidate_score")
+        actual_data = item.get("actual_data", {}) or {}
+        chart_data = item.get("chart_data", {}) or {}
+        component_scores = item.get("component_scores", {}) or {}
+
+        return {
+            "rank": rank,
+            "badge_label": f"종목 {rank}",
+            "ticker": item.get("ticker"),
+            "company_name": item.get("company_name"),
+            "as_of_date": item.get("as_of_date"),
+            "score": self._round_or_none(score, 3),
+            "score_display": self._format_score(score, 1),
+            "quick_summary": self._truncate_text(
+                llm_candidate_text.get("quick_summary"),
+                120,
+            ),
+            "chart": self._build_chart_payload(chart_data),
+            "actual_data": self._build_actual_data_table(actual_data),
+            "component_scores": self._build_component_score_items(component_scores),
+            "top_component_highlights": self._build_top_component_highlights(item),
+            "top_news": self._build_news_items(
+                news_list=item.get("top_news_3", []),
+                llm_news_summaries=llm_candidate_text.get("news_summaries", []),
+            ),
+            "entry_reason": {
+                "title": "순위 진입 이유",
+                "body": self._truncate_text(
+                    llm_candidate_text.get("entry_reason"),
+                    240,
+                ),
+                "raw_main_reason": self._safe_get(item, "ranking_reason.main_reason"),
+                "supporting_reasons": self._safe_get(
+                    item,
+                    "ranking_reason.supporting_reasons",
+                    default=[],
+                ),
+            },
+            "positive_evidence": item.get("positive_evidence", [])[:5],
+            "negative_evidence": item.get("negative_evidence", [])[:5],
+            "caution": {
+                "title": "주의할 점",
+                "body": self._truncate_text(
+                    llm_candidate_text.get("caution_note"),
+                    180,
+                ),
+            },
+            "risk": self._build_risk_payload(item),
+            "snapshots": {
+                "market_analysis": item.get("market_analysis_snapshot", {}),
+                "news_signal": item.get("news_signal_snapshot", {}),
+                "risk": item.get("risk_snapshot", {}),
+            },
+            "data_quality": item.get("data_quality", {}),
+        }
+
+    def _build_chart_payload(self, chart_data: Dict[str, Any]) -> Dict[str, Any]:
+        price_series = chart_data.get("recent_price_series", []) or []
+        volume_series = chart_data.get("recent_volume_series", []) or []
+        moving_average_series = chart_data.get("moving_average_series_optional", []) or []
+
+        return {
+            "type": "price_volume_ma",
+            "title": "주가 흐름 차트",
+            "period": chart_data.get("period", {}),
+            "series": {
+                "price": [
+                    {
+                        "date": row.get("date"),
+                        "open": row.get("open"),
+                        "high": row.get("high"),
+                        "low": row.get("low"),
+                        "close": row.get("close"),
+                        "volume": row.get("volume"),
+                        "daily_return": row.get("daily_return"),
+                        "ma20_close": row.get("ma20_close"),
+                        "ma60_close": row.get("ma60_close"),
+                        "rsi_14": row.get("rsi_14"),
+                        "market_regime_20": row.get("market_regime_20"),
+                        "market_regime_60": row.get("market_regime_60"),
+                    }
+                    for row in price_series
+                    if isinstance(row, dict)
+                ],
+                "volume": [
+                    {
+                        "date": row.get("date"),
+                        "volume": row.get("volume"),
+                        "volume_zscore_20d": row.get("volume_zscore_20d"),
+                        "volume_zscore_60d": row.get("volume_zscore_60d"),
+                    }
+                    for row in volume_series
+                    if isinstance(row, dict)
+                ],
+                "moving_average": [
+                    {
+                        "date": row.get("date"),
+                        "close": row.get("close"),
+                        "ma20_close": row.get("ma20_close"),
+                        "ma60_close": row.get("ma60_close"),
+                        "ma120_close": row.get("ma120_close"),
+                    }
+                    for row in moving_average_series
+                    if isinstance(row, dict)
+                ],
+            },
+            "summary": chart_data.get("chart_summary", {}),
+            "frontend_hint": {
+                "x_axis": "date",
+                "primary_y_axis": "close",
+                "secondary_y_axis": "volume",
+                "recommended_lines": ["close", "ma20_close", "ma60_close"],
+            },
+        }
+
+    def _build_actual_data_table(self, actual_data: Dict[str, Any]) -> Dict[str, Any]:
+        market_cap = actual_data.get("market_cap")
+        per = actual_data.get("per")
+
+        return {
+            "title": "실제 데이터",
+            "latest_date": actual_data.get("latest_date"),
+            "raw": copy.deepcopy(actual_data),
+            "items": [
+                {
+                    "key": "latest_close",
+                    "label": "종가",
+                    "value": self._format_krw(actual_data.get("latest_close")),
+                    "raw_value": actual_data.get("latest_close"),
+                },
+                {
+                    "key": "daily_return",
+                    "label": "일간 등락률",
+                    "value": self._format_percent_ratio(
+                        actual_data.get("daily_return"),
+                        signed=True,
+                    ),
+                    "raw_value": actual_data.get("daily_return"),
+                },
+                {
+                    "key": "trading_value",
+                    "label": "거래대금",
+                    "value": self._format_krw(actual_data.get("trading_value")),
+                    "raw_value": actual_data.get("trading_value"),
+                },
+                {
+                    "key": "volume",
+                    "label": "거래량",
+                    "value": self._format_number(actual_data.get("volume")),
+                    "raw_value": actual_data.get("volume"),
+                },
+                {
+                    "key": "foreign_net_flow_ratio",
+                    "label": "외국인 순매수 비율",
+                    "value": self._format_percent_ratio(
+                        actual_data.get("foreign_net_flow_ratio")
+                    ),
+                    "raw_value": actual_data.get("foreign_net_flow_ratio"),
+                },
+                {
+                    "key": "foreign_ownership_level",
+                    "label": "외국인 보유 비중",
+                    "value": self._format_percent_point(
+                        actual_data.get("foreign_ownership_level")
+                    ),
+                    "raw_value": actual_data.get("foreign_ownership_level"),
+                },
+                {
+                    "key": "roe",
+                    "label": "ROE",
+                    "value": self._format_percent_ratio(actual_data.get("roe")),
+                    "raw_value": actual_data.get("roe"),
+                },
+                {
+                    "key": "operating_income_yoy",
+                    "label": "영업이익 YoY",
+                    "value": self._format_percent_ratio(
+                        actual_data.get("operating_income_yoy")
+                    ),
+                    "raw_value": actual_data.get("operating_income_yoy"),
+                },
+                {
+                    "key": "risk_level",
+                    "label": "리스크 등급",
+                    "value": self._risk_level_ko(actual_data.get("risk_level")),
+                    "raw_value": actual_data.get("risk_level"),
+                },
+                {
+                    "key": "market_cap",
+                    "label": "시가총액",
+                    "value": self._format_krw(market_cap) if market_cap is not None else "-",
+                    "raw_value": market_cap,
+                    "is_missing": market_cap is None,
+                },
+                {
+                    "key": "per",
+                    "label": "PER",
+                    "value": self._format_multiple(per) if per is not None else "-",
+                    "raw_value": per,
+                    "is_missing": per is None,
+                },
+            ],
+        }
+
+    def _build_component_score_items(
+        self,
+        component_scores: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        return [
+            {
+                "key": key,
+                "label": self.COMPONENT_LABELS.get(key, key),
+                "score": self._round_or_none(value, 3),
+                "display_value": self._format_score(value, 1),
+            }
+            for key, value in component_scores.items()
+        ]
+
+    def _build_top_component_highlights(
+        self,
+        item: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        top_components = self._safe_get(
+            item,
+            "ranking_reason.score_basis.top_component_scores",
+            default=[],
+        )
+
+        result = []
+
+        if isinstance(top_components, list):
+            for c in top_components:
+                if not isinstance(c, dict):
+                    continue
+
+                key = c.get("name")
+
+                result.append(
+                    {
+                        "key": key,
+                        "label": c.get("label") or self.COMPONENT_LABELS.get(key, key),
+                        "score": self._round_or_none(c.get("score"), 3),
+                        "display_value": self._format_score(c.get("score"), 1),
+                    }
+                )
+
+        if result:
+            return result
+
+        component_scores = item.get("component_scores", {}) or {}
+
+        sorted_items = sorted(
+            component_scores.items(),
+            key=lambda kv: kv[1] if self._is_number(kv[1]) else -999,
+            reverse=True,
+        )
+
+        for key, value in sorted_items[:2]:
+            result.append(
+                {
+                    "key": key,
+                    "label": self.COMPONENT_LABELS.get(key, key),
+                    "score": self._round_or_none(value, 3),
+                    "display_value": self._format_score(value, 1),
+                }
+            )
+
+        return result
+
+    def _build_news_items(
+        self,
+        news_list: List[Dict[str, Any]],
+        llm_news_summaries: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        result = []
+        llm_news_summaries = llm_news_summaries or []
+
+        if not isinstance(news_list, list):
+            news_list = []
+
+        for idx, news in enumerate(news_list[: self.max_news_per_candidate]):
+            if not isinstance(news, dict):
+                continue
+
+            llm_summary = (
+                llm_news_summaries[idx]
+                if idx < len(llm_news_summaries)
+                else None
+            )
+
+            summary = self._first_non_empty(
+                llm_summary,
+                news.get("summary_optional"),
+                news.get("title"),
+                default="관련 뉴스가 확인되었습니다.",
+            )
+
+            result.append(
+                {
+                    "order": idx + 1,
+                    "title": news.get("title"),
+                    "source": news.get("source"),
+                    "published_at": news.get("published_at"),
+                    "url": news.get("url"),
+                    "summary": self._truncate_text(summary, 120),
+                    "article_score": news.get("article_score"),
+                    "rule_score_0_1": news.get("rule_score_0_1"),
+                }
+            )
+
+        return result
+
+    def _build_risk_payload(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        actual_data = item.get("actual_data", {}) or {}
+        risk_snapshot = item.get("risk_snapshot", {}) or {}
+        risk_scores = risk_snapshot.get("risk_scores", {}) or {}
+
+        level = actual_data.get("risk_level") or risk_scores.get("risk_level")
+
+        return {
+            "level": self._normalize_risk_level(level),
+            "level_label": self._risk_level_ko(level),
+            "overall_risk_score": self._round_or_none(
+                actual_data.get("overall_risk_score")
+                or risk_scores.get("overall_risk_score"),
+                3,
+            ),
+            "dominant_risk_factors": risk_snapshot.get("dominant_risk_factors", []),
+            "risk_scores": risk_scores,
+            "notes": item.get("risk_notes", [])[:5],
+            "evidence": risk_snapshot.get("evidence", [])[:5],
+        }
+
+    def _build_glossary(self, evidence: Dict[str, Any]) -> List[Dict[str, Any]]:
+        raw_glossary = evidence.get("glossary") or evidence.get("terms_glossary") or []
+        result = []
+
+        if isinstance(raw_glossary, list):
+            for item in raw_glossary:
+                if not isinstance(item, dict):
+                    continue
+
+                term = item.get("term")
+                if not term:
+                    continue
+
+                result.append(
+                    {
+                        "term": term,
+                        "description": self._first_non_empty(
+                            item.get("plain_korean_definition"),
+                            item.get("description"),
+                            item.get("definition"),
+                            default="리포트 이해를 돕기 위한 용어입니다.",
+                        ),
+                        "why_it_matters": self._first_non_empty(
+                            item.get("why_it_matters"),
+                            default="해당 지표를 함께 보면 종목을 더 입체적으로 이해할 수 있습니다.",
+                        ),
+                    }
+                )
+
+        default_terms = [
+            {
+                "term": "외국인 순매수",
+                "description": "외국인 투자자가 판 금액보다 산 금액이 더 많은 상태를 의미합니다.",
+                "why_it_matters": "수급 관심이 어느 종목에 몰리는지 확인할 때 참고할 수 있습니다.",
+            },
+            {
+                "term": "PER",
+                "description": "주가가 기업의 이익에 비해 얼마나 높거나 낮게 평가되어 있는지 보여주는 지표입니다.",
+                "why_it_matters": "기업의 가격 부담을 간단히 비교할 때 사용됩니다.",
+            },
+            {
+                "term": "ROE",
+                "description": "자기자본 대비 순이익을 얼마나 냈는지 보여주는 수익성 지표입니다.",
+                "why_it_matters": "기업이 가진 자본을 얼마나 효율적으로 활용하는지 볼 때 사용합니다.",
+            },
+            {
+                "term": "리스크 점수",
+                "description": "변동성, 낙폭, 재무 부담, 뉴스 이벤트 등을 종합한 위험도 점수입니다.",
+                "why_it_matters": "점수가 높을수록 가격 흔들림이나 불확실성에 더 주의해야 합니다.",
+            },
+        ]
+
+        existing = {x["term"] for x in result}
+
+        for term in default_terms:
+            if term["term"] not in existing:
+                result.append(term)
+
+        return result
+
+    # ============================================================
+    # LLM generation
+    # ============================================================
+
+    def _generate_text_pack(
+        self,
+        evidence: Dict[str, Any],
+        ctx: RunContext,
+    ) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+        if not self.use_llm or self.llm_provider == "none":
+            return None, {
+                "used": False,
+                "provider": self.llm_provider,
+                "model": "",
+                "note": "LLM disabled. Rule-based fallback text used.",
+            }
+
+        prompt = self._build_llm_prompt(evidence)
+
+        providers = self._resolve_llm_providers()
+
+        if not providers:
+            return None, {
+                "used": False,
+                "provider": self.llm_provider,
+                "model": "",
+                "note": "No LLM API key found. Rule-based fallback text used.",
+            }
+
+        last_error = None
+
+        for provider in providers:
+            try:
+                if provider == "gemini":
+                    ctx.logger.info("[ReportGenerativeAgent] Gemini text generation start.")
+                    raw = self._call_gemini(prompt)
+                    parsed = self._parse_json_response(raw)
+                    return parsed, {
+                        "used": True,
+                        "provider": "gemini",
+                        "model": self.gemini_model_name,
+                        "note": "LLM-generated report text used.",
+                    }
+
+                if provider == "openai":
+                    ctx.logger.info("[ReportGenerativeAgent] OpenAI text generation start.")
+                    raw = self._call_openai(prompt)
+                    parsed = self._parse_json_response(raw)
+                    return parsed, {
+                        "used": True,
+                        "provider": "openai",
+                        "model": self.openai_model_name,
+                        "note": "LLM-generated report text used.",
+                    }
+
+            except Exception as e:
+                last_error = str(e)
+                ctx.logger.warning(
+                    f"[ReportGenerativeAgent] {provider} failed. Error: {last_error}"
+                )
+
+        return None, {
+            "used": False,
+            "provider": self.llm_provider,
+            "model": "",
+            "note": "All LLM providers failed. Rule-based fallback text used.",
+            "error": last_error,
+        }
+
+    def _resolve_llm_providers(self) -> List[str]:
+        google_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+        openai_key = os.getenv("OPENAI_API_KEY")
+
+        if self.llm_provider == "gemini":
+            return ["gemini"] if google_key else []
+
+        if self.llm_provider == "openai":
+            return ["openai"] if openai_key else []
+
+        providers = []
+
+        if google_key:
+            providers.append("gemini")
+
+        if openai_key:
+            providers.append("openai")
+
+        return providers
+
+    def _call_gemini(self, prompt: str) -> str:
+        from google import genai
+        from google.genai import types
+
+        api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            raise EnvironmentError("GOOGLE_API_KEY 또는 GEMINI_API_KEY가 없습니다.")
+
+        client = genai.Client(api_key=api_key)
+
+        response = client.models.generate_content(
+            model=self.gemini_model_name,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.2,
+                response_mime_type="application/json",
+            ),
+        )
+
+        return response.text or ""
+
+    def _call_openai(self, prompt: str) -> str:
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise EnvironmentError("OPENAI_API_KEY가 없습니다.")
+
+        from openai import OpenAI
+
+        client = OpenAI(api_key=api_key)
+
+        response = client.responses.create(
+            model=self.openai_model_name,
+            input=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a Korean financial report generation agent. "
+                        "Return only valid JSON. Do not invent facts. "
+                        "Do not change rankings, scores, numbers, or URLs."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": prompt,
+                },
+            ],
+            text={
+                "format": {
+                    "type": "json_object",
+                }
+            },
+            temperature=0.2,
+        )
+
+        return response.output_text or ""
+
+    def _build_llm_prompt(self, evidence: Dict[str, Any]) -> str:
+        market_context = evidence.get("market_context", {}) or {}
+        top10 = evidence.get("top10_evidence", []) or []
+
+        compact_candidates = []
+
+        for item in top10:
+            ranking_reason = item.get("ranking_reason", {}) or {}
+            actual_data = item.get("actual_data", {}) or {}
+            chart_summary = self._safe_get(item, "chart_data.chart_summary", {})
+            score_basis = self._safe_get(
+                item,
+                "ranking_reason.score_basis",
+                {},
+            )
+
+            compact_candidates.append(
+                {
+                    "rank": item.get("rank"),
+                    "ticker": item.get("ticker"),
+                    "company_name": item.get("company_name"),
+                    "score": item.get("market_flow_candidate_score"),
+                    "risk_level": actual_data.get("risk_level"),
+                    "main_reason": ranking_reason.get("main_reason"),
+                    "supporting_reasons": ranking_reason.get("supporting_reasons", [])[:5],
+                    "beginner_explanation": ranking_reason.get("beginner_explanation"),
+                    "caution_note": ranking_reason.get("caution_note"),
+                    "positive_evidence": item.get("positive_evidence", [])[:5],
+                    "negative_evidence": item.get("negative_evidence", [])[:3],
+                    "risk_notes": item.get("risk_notes", [])[:4],
+                    "top_component_scores": score_basis.get("top_component_scores", []),
+                    "chart_summary": {
+                        "latest_close": chart_summary.get("latest_close"),
+                        "daily_return": actual_data.get("daily_return"),
+                        "close_change_30d": chart_summary.get("close_change_30d"),
+                        "rsi_14": chart_summary.get("rsi_14"),
+                        "market_regime_20": chart_summary.get("market_regime_20"),
+                        "market_regime_60": chart_summary.get("market_regime_60"),
+                    },
+                    "top_news_3": [
+                        {
+                            "title": n.get("title"),
+                            "summary_optional": n.get("summary_optional"),
+                            "published_at": n.get("published_at"),
+                        }
+                        for n in item.get("top_news_3", [])[:3]
+                        if isinstance(n, dict)
+                    ],
+                }
+            )
+
+        compact_input = {
+            "report_context": evidence.get("report_context", {}),
+            "market_context": {
+                "market_one_line_summary": market_context.get("market_one_line_summary"),
+                "market_brief": market_context.get("market_brief"),
+                "market_keywords": market_context.get("market_keywords", []),
+                "core_market_drivers": market_context.get("core_market_drivers", []),
+                "market_phase": market_context.get("market_phase"),
+                "market_tone": market_context.get("market_tone"),
+                "market_risk_notes": market_context.get("market_risk_notes", []),
+            },
+            "candidates": compact_candidates,
+        }
+
+        output_schema = {
+            "market_summary": {
+                "headline": "오늘 시장을 한 문장으로 요약",
+                "body": "2문장 이내의 시장 요약",
+                "tone_label": "긍정/중립/혼재/부정 중 하나",
+            },
+            "candidates": {
+                "티커": {
+                    "quick_summary": "종목 카드 상단 1문장 요약",
+                    "entry_reason": "순위 진입 이유 1~2문장",
+                    "caution_note": "주의사항 1문장",
+                    "news_summaries": [
+                        "뉴스 1 카드용 요약",
+                        "뉴스 2 카드용 요약",
+                        "뉴스 3 카드용 요약",
+                    ],
+                }
+            },
+        }
+
+        return f"""
+아래 데이터를 바탕으로 프론트 카드형 리포트에 들어갈 자연어 문장만 생성해줘.
+반드시 JSON만 반환해.
+
+중요 규칙:
+1. 입력에 없는 사실을 만들지 마.
+2. 순위, 점수, 수치, 뉴스 제목, 뉴스 URL은 변경하지 마.
+3. 매수 추천, 수익 보장, 목표주가, 단기 급등 예측처럼 쓰지 마.
+4. 후보 종목은 '관심 있게 확인할 만한 종목'으로만 표현해.
+5. 리스크는 반드시 함께 언급해.
+6. 초보 투자자가 이해하기 쉽게 써.
+7. 후보별 candidates의 key는 반드시 ticker 값으로 사용해.
+
+반환 스키마:
+{json.dumps(output_schema, ensure_ascii=False, indent=2)}
+
+입력 데이터:
+{json.dumps(compact_input, ensure_ascii=False, indent=2)}
+""".strip()
+
+    def _parse_json_response(self, text: str) -> Dict[str, Any]:
+        text = (text or "").strip()
+
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            pass
+
+        fence_match = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)
+        if fence_match:
+            candidate = fence_match.group(1).strip()
+            return json.loads(candidate)
+
+        start = text.find("{")
+        end = text.rfind("}")
+
+        if start != -1 and end != -1 and end > start:
+            candidate = text[start:end + 1]
+            return json.loads(candidate)
+
+        raise ValueError("Failed to parse LLM response as JSON.")
+
+    # ============================================================
+    # Fallback text
+    # ============================================================
+
+    def _fallback_market_text(self, market_context: Dict[str, Any]) -> Dict[str, str]:
+        summary_box = market_context.get("report_summary_box", {}) or {}
+
+        headline = self._first_non_empty(
+            market_context.get("market_one_line_summary"),
+            summary_box.get("body"),
+            default="오늘 시장은 종목별 차별화가 중요한 흐름입니다.",
+        )
+
+        phase = market_context.get("market_phase", "혼재 국면")
+        keywords = market_context.get("market_keywords", []) or []
+
+        if keywords:
+            body = f"{phase} 속에서 {', '.join(keywords[:3])} 흐름을 함께 확인할 필요가 있습니다."
+        else:
+            body = self._first_non_empty(
+                market_context.get("market_brief"),
+                summary_box.get("body"),
+                default=headline,
+            )
+
+        return {
+            "headline": self._truncate_text(headline, 100),
+            "body": self._truncate_text(body, 180),
+            "tone_label": self._tone_label_ko(market_context.get("market_tone")),
+        }
+
+    def _fallback_candidate_text(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        company_name = item.get("company_name") or item.get("ticker")
+        ranking_reason = item.get("ranking_reason", {}) or {}
+        actual_data = item.get("actual_data", {}) or {}
+        score_basis = self._safe_get(item, "ranking_reason.score_basis", {})
+        top_components = score_basis.get("top_component_scores", []) or []
+
+        if top_components:
+            labels = [
+                c.get("label")
+                for c in top_components
+                if isinstance(c, dict) and c.get("label")
+            ]
+            factor_text = "와 ".join(labels[:2]) if labels else "주요 데이터"
+            quick_summary = f"{company_name}은 {factor_text} 신호가 상대적으로 높게 나타난 후보입니다."
+        else:
+            quick_summary = f"{company_name}은 현재 시장 흐름에서 관심 있게 확인할 만한 후보입니다."
+
+        entry_reason = self._first_non_empty(
+            ranking_reason.get("beginner_explanation"),
+            ranking_reason.get("main_reason"),
+            ranking_reason.get("original_ranking_reason_short"),
+            default=quick_summary,
+        )
+
+        caution_note = self._first_non_empty(
+            ranking_reason.get("caution_note"),
+            *(item.get("risk_notes", [])[:2]),
+            default=(
+                f"리스크 등급은 {self._risk_level_ko(actual_data.get('risk_level'))}이며, "
+                "가격 변동 가능성을 함께 확인해야 합니다."
+            ),
+        )
+
+        news_summaries = []
+
+        for news in item.get("top_news_3", [])[: self.max_news_per_candidate]:
+            if not isinstance(news, dict):
+                continue
+
+            news_summaries.append(
+                self._truncate_text(
+                    self._first_non_empty(
+                        news.get("summary_optional"),
+                        news.get("title"),
+                        default="관련 뉴스가 확인되었습니다.",
+                    ),
+                    120,
+                )
+            )
+
+        return {
+            "quick_summary": self._truncate_text(quick_summary, 120),
+            "entry_reason": self._truncate_text(entry_reason, 240),
+            "caution_note": self._truncate_text(caution_note, 180),
+            "news_summaries": news_summaries,
+        }
+
+    # ============================================================
+    # Manifest / validation
+    # ============================================================
+
+    def _build_manifest(
+        self,
+        evidence_path: Path,
+        evidence_manifest_path: Optional[Path],
+        report_output_contract_path: Optional[Path],
+        result_path: Path,
+        report: Dict[str, Any],
+        is_valid: bool,
+        warnings: List[str],
+        llm_status: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        candidates = self._safe_get(report, "candidate_section.candidates", default=[])
+
+        return {
+            "agent": self.__class__.__name__,
+            "stage": self.stage,
+            "version": self.version,
+            "created_at_utc": self._now_utc(),
+            "input_files": {
+                "report_evidence_result": str(evidence_path),
+                "evidence_manifest": (
+                    str(evidence_manifest_path) if evidence_manifest_path else None
+                ),
+                "report_output_contract": (
+                    str(report_output_contract_path) if report_output_contract_path else None
+                ),
+            },
+            "output_files": {
+                "report_output": str(result_path),
+            },
+            "llm_status": llm_status,
+            "summary": {
+                "as_of_date": self._safe_get(report, "report_meta.as_of_date"),
+                "report_title": self._safe_get(report, "report_meta.title"),
+                "n_candidates": len(candidates),
+                "is_valid": is_valid,
+                "warnings": warnings,
+                "candidates": [
+                    {
+                        "rank": c.get("rank"),
+                        "ticker": c.get("ticker"),
+                        "company_name": c.get("company_name"),
+                        "score": c.get("score"),
+                        "risk_level": self._safe_get(c, "risk.level"),
+                        "news_count": len(c.get("top_news", [])),
+                        "chart_points": len(
+                            self._safe_get(c, "chart.series.price", default=[])
+                        ),
+                    }
+                    for c in candidates
+                    if isinstance(c, dict)
+                ],
+            },
+        }
+
+    def _validate_report_output(self, report: Dict[str, Any]) -> Tuple[bool, List[str]]:
+        warnings = []
+        candidates = self._safe_get(report, "candidate_section.candidates", default=[])
+
+        if not candidates:
+            warnings.append("candidate_section.candidates가 비어 있습니다.")
+
+        ranks = [c.get("rank") for c in candidates if isinstance(c, dict)]
+
+        if len(ranks) != len(set(ranks)):
+            warnings.append("후보 rank가 중복됩니다.")
+
+        for c in candidates:
+            if not isinstance(c, dict):
+                continue
+
+            ticker = c.get("ticker")
+
+            if not ticker:
+                warnings.append(f"rank={c.get('rank')} 후보에 ticker가 없습니다.")
+
+            if not c.get("company_name"):
+                warnings.append(f"rank={c.get('rank')} 후보에 company_name이 없습니다.")
+
+            if not self._safe_get(c, "chart.series.price", default=[]):
+                warnings.append(f"{ticker} 차트 price series가 비어 있습니다.")
+
+            if len(c.get("top_news", [])) < self.max_news_per_candidate:
+                warnings.append(f"{ticker} 뉴스가 {self.max_news_per_candidate}개 미만입니다.")
+
+            if not self._safe_get(c, "actual_data.items", default=[]):
+                warnings.append(f"{ticker} actual_data.items가 비어 있습니다.")
+
+        return len(warnings) == 0, warnings
+
+    # ============================================================
+    # File helpers
+    # ============================================================
+
+    def _find_single_file(
         self,
         run_dir: Path,
-        filename: str,
-        preferred_parent: Optional[str] = None,
+        pattern: str,
+        ctx: RunContext,
     ) -> Optional[Path]:
-        matches = [p for p in run_dir.rglob(filename) if p.is_file() and p.name == filename]
-        if preferred_parent:
-            preferred = [p for p in matches if p.parent.name == preferred_parent]
-            if preferred:
-                return sorted(preferred)[0]
-        if not matches:
-            print(f"[WARN] No exact file matched: {filename}")
-            return None
-        if len(matches) > 1:
-            print(f"[WARN] Multiple exact files matched: {filename}")
-            for p in sorted(matches):
-                print(f" - {p}")
-        return sorted(matches)[0]
+        matches = sorted(run_dir.rglob(pattern))
 
-    def _read_json(self, path: Path) -> Dict[str, Any]:
-        with open(path, "r", encoding=self.encoding) as f:
-            return json.load(f)
+        if not matches:
+            ctx.logger.info(f"[ReportGenerativeAgent] No file matched: {pattern}")
+            return None
+
+        if len(matches) > 1:
+            ctx.logger.warning(
+                f"[ReportGenerativeAgent] Multiple files matched: {pattern}. "
+                f"Using first: {matches[0]}"
+            )
+
+        return matches[0]
+
+    def _safe_read_json(
+        self,
+        path: Optional[Path],
+        ctx: RunContext,
+    ) -> Optional[Dict[str, Any]]:
+        if path is None:
+            return None
+
+        if not path.exists():
+            ctx.logger.warning(f"[ReportGenerativeAgent] Missing JSON: {path}")
+            return None
+
+        try:
+            with open(path, "r", encoding=self.encoding) as f:
+                return json.load(f)
+        except UnicodeDecodeError:
+            with open(path, "r", encoding="utf-8-sig") as f:
+                return json.load(f)
+        except Exception as e:
+            ctx.logger.warning(
+                f"[ReportGenerativeAgent] Failed to read JSON: {path} ({e})"
+            )
+            return None
 
     @staticmethod
     def _save_json(obj: Dict[str, Any], path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(obj, f, ensure_ascii=False, indent=2)
 
-    # ═══════════════════════════════════════════════════════════════════════════
-    # StageResult helper (기존 유지)
-    # ═══════════════════════════════════════════════════════════════════════════
-
-    def _make_stage_result(self, status, message, metrics=None, outputs=None) -> StageResult:
-        sig = inspect.signature(StageResult)
-        candidate_kwargs = {
-            "stage":    self.stage,
-            "status":   status,
-            "message":  message,
-            "metrics":  metrics or {},
-            "outputs":  outputs or {},
-            "artifacts":outputs or {},
-        }
-        kwargs = {k: v for k, v in candidate_kwargs.items() if k in sig.parameters}
-        return StageResult(**kwargs)
-
-    # ═══════════════════════════════════════════════════════════════════════════
-    # Basic utils (기존 유지)
-    # ═══════════════════════════════════════════════════════════════════════════
+    # ============================================================
+    # Format helpers
+    # ============================================================
 
     @staticmethod
     def _now_utc() -> str:
         return datetime.now(timezone.utc).isoformat()
 
     @staticmethod
-    def _zfill6(x: Any) -> str:
-        return str(x).replace(".0", "").zfill(6)
+    def _is_number(value: Any) -> bool:
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
 
-    @staticmethod
-    def _safe_float(x: Any, default: Any = None) -> Optional[float]:
-        try:
-            if x is None:
-                return default
-            v = float(x)
-            if math.isnan(v):
-                return default
-            return v
-        except Exception:
-            return default
-
-    @classmethod
-    def _fmt_num(cls, x: Any, nd: int = 4) -> str:
-        v = cls._safe_float(x)
-        if v is None:
-            return "N/A"
-        return f"{v:.{nd}f}"
-
-    @classmethod
-    def _fmt_pct(cls, x: Any, nd: int = 2) -> str:
-        v = cls._safe_float(x)
-        if v is None:
-            return "N/A"
-        return f"{v * 100:.{nd}f}%"
-
-    def _normalize_ticker_date(self, df: pd.DataFrame) -> None:
-        if "ticker" in df.columns:
-            df["ticker"] = df["ticker"].apply(self._zfill6)
-        elif "종목코드" in df.columns:
-            df["ticker"] = df["종목코드"].apply(self._zfill6)
-        else:
-            raise ValueError("Input CSV must contain 'ticker' or '종목코드' column.")
-        if "date" in df.columns:
-            df["date"] = pd.to_datetime(df["date"], errors="coerce")
-        if "as_of_date" in df.columns:
-            df["as_of_date"] = pd.to_datetime(df["as_of_date"], errors="coerce")
-
-    def _resolve_col(
-        self,
-        df: pd.DataFrame,
-        exact_candidates: List[Optional[str]],
-        prefixes: List[str],
-        fallback_contains: List[str],
-        required: bool = True,
-    ) -> Optional[str]:
-        for col in exact_candidates:
-            if col and col in df.columns:
-                return col
-        for prefix in prefixes:
-            matches = [c for c in df.columns if str(c).startswith(prefix)]
-            if matches:
-                return matches[0]
-        lowered = {c: str(c).lower() for c in df.columns}
-        for keyword in fallback_contains:
-            matches = [c for c, lc in lowered.items() if keyword.lower() in lc]
-            if matches:
-                return matches[0]
-        if required:
-            raise ValueError(
-                f"Could not resolve required prediction column. "
-                f"keywords={fallback_contains}, columns={list(df.columns)}"
-            )
+    def _round_or_none(self, value: Any, ndigits: int = 3) -> Optional[float]:
+        if self._is_number(value):
+            return round(float(value), ndigits)
         return None
 
-    # ═══════════════════════════════════════════════════════════════════════════
-    # Model/metric helpers (기존 유지)
-    # ═══════════════════════════════════════════════════════════════════════════
+    @staticmethod
+    def _safe_get(data: Any, path: str, default: Any = None) -> Any:
+        cur = data
 
-    def _build_performance_summary(self, metrics, selected_models):
-        out = {}
-        for target, model_id in selected_models.items():
-            target_metrics = metrics.get(target, {})
-            if isinstance(target_metrics, dict):
-                out[target] = {
-                    "selected_model": model_id,
-                    "metrics": target_metrics.get(model_id, {}),
-                }
-        return out
+        for key in path.split("."):
+            if not isinstance(cur, dict):
+                return default
 
-    def _build_feature_importance_summary(self, feature_importance, selected_models, k=10):
-        out = {}
-        for target, model_id in selected_models.items():
-            rows = feature_importance.get(model_id, [])
-            parsed = []
-            for r in rows:
-                feat = r.get("feature")
-                imp  = self._safe_float(r.get("importance"))
-                if feat is None:
-                    continue
-                parsed.append({"feature": feat, "importance": imp})
-            parsed = sorted(parsed, key=lambda x: abs(x["importance"]) if x["importance"] is not None else -1, reverse=True)
-            out[target] = {"selected_model": model_id, "top_features": parsed[:k]}
-        return out
+            cur = cur.get(key)
 
-    # ═══════════════════════════════════════════════════════════════════════════
-    # Optional upstream JSON helpers
-    # ═══════════════════════════════════════════════════════════════════════════
+            if cur is None:
+                return default
 
-    def _load_optional_ticker_map(
-        self,
-        path: Optional[Path],
-        key: Optional[str] = None,
-        list_key: Optional[str] = None,
-    ) -> Dict[str, Dict[str, Any]]:
-        """
-        list_key : 최우선 탐색 키 (market_analysis → "ticker_analyses")
-        key      : 차순위 탐색 키
-        """
-        if path is None or not path.exists():
-            return {}
-        obj = self._read_json(path)
-
-        # 탐색 순서: list_key → key → 자동 탐색
-        rows = None
-        if list_key:
-            rows = obj.get(list_key)
-        if rows is None and key:
-            rows = obj.get(key)
-        if rows is None:
-            rows = (
-                obj.get("tickers")
-                or obj.get("ticker_analyses")
-                or obj.get("results")
-                or []
-            )
-
-        out = {}
-        for row in rows:
-            ticker = row.get("ticker") or row.get("종목코드") or row.get("code")
-            if ticker:
-                out[self._zfill6(ticker)] = row
-        return out
-
-    def _get_risk_brief(self, ticker, risk_map) -> Dict[str, Any]:
-        row    = risk_map.get(ticker, {})
-        scores = row.get("risk_scores") or {}
-        return {
-            "risk_level":            scores.get("risk_level"),
-            "overall_risk_score":    scores.get("overall_risk_score"),
-            "dominant_risk_factors": (row.get("dominant_risk_factors") or [])[:3],
-            "evidence":              (row.get("evidence") or [])[:3],
-        }
-
-    # ═══════════════════════════════════════════════════════════════════════════
-    # [수정 2] _get_market_brief — interpretation, positive_factors, risk_factors 추가
-    # ═══════════════════════════════════════════════════════════════════════════
-    def _get_market_brief(self, ticker, market_map) -> Dict[str, Any]:
-        row            = market_map.get(ticker, {})
-        compact        = row.get("compact_signals") or {}
-        price_summary  = row.get("price_summary") or {}
-        scores         = row.get("scores") or {}
-        return_state   = row.get("return_state") or {}
-
-        return {
-            "ticker_type":          row.get("ticker_type"),
-            "phase":                row.get("phase"),
-            "tone":                 row.get("tone"),
-            "rsi_state":            row.get("rsi_state"),
-            "market_context":       row.get("market_context"),
-            "interpretation":       row.get("interpretation"),
-            "return_20d":           compact.get("return_20d") or price_summary.get("cum_return_20d"),
-            "return_60d":           compact.get("return_60d") or price_summary.get("cum_return_60d"),
-            "ann_volatility_252d":  compact.get("ann_volatility_252d") or price_summary.get("ann_volatility_252d"),
-            "max_drawdown_252d":    compact.get("max_drawdown_252d") or price_summary.get("max_drawdown_252d"),
-            "return_20d_state":     return_state.get("return_20d_state"),
-            "return_60d_state":     return_state.get("return_60d_state"),
-            "overall_score":        scores.get("overall_score"),
-            "positive_factors":     (row.get("positive_factors") or [])[:3],
-            "risk_factors":         (row.get("risk_factors") or [])[:2],
-            "key_findings":         (row.get("key_findings") or [])[:4],
-        }
-
-    # ═══════════════════════════════════════════════════════════════════════════
-    # [수정 3] _get_news_brief — reasons, top_articles headline 추가
-    # ═══════════════════════════════════════════════════════════════════════════
-    def _get_news_brief(self, ticker, news_map) -> Dict[str, Any]:
-        row     = news_map.get(ticker, {})
-        summary = row.get("news_summary") or {}
-
-        top_articles_raw = row.get("top_articles") or []
-        top_headline = None
-        if top_articles_raw:
-            a = top_articles_raw[0]
-            top_headline = {
-                "date":  a.get("date"),
-                "title": a.get("title"),
-                "press": a.get("press"),
-                "url":   a.get("url"),
-            }
-
-        return {
-            "news_signal_score":       row.get("news_signal_score"),
-            "confidence_level":        row.get("confidence_level"),
-            "verdict":                 row.get("verdict"),
-            "n_articles_30d_unique":   summary.get("n_articles_30d_unique"),
-            "noise_ratio_0_1":         summary.get("noise_ratio_0_1"),
-            "high_impact_ratio_0_1":   summary.get("high_impact_ratio_0_1"),
-            "reasons":                 (row.get("reasons") or [])[:2],     # 신호 근거
-            "top_headline":            top_headline,                        # 대표 기사 헤드라인
-        }
-
-    # ═══════════════════════════════════════════════════════════════════════════
-    # Markdown helpers
-    # ═══════════════════════════════════════════════════════════════════════════
-
-    def _term(self, key: str, user_level: str) -> str:
-        """초보 레벨에서는 용어 설명을 괄호 안에 병기."""
-        label = TERM_GLOSSARY.get(key, key)
-        if user_level == "beginner":
-            return label
-        return key   # 중급/고급은 원래 용어 그대로
-
-    def _build_selection_reason(self, item: Dict[str, Any]) -> List[str]:
-        reasons = []
-        rank_score = self._safe_float(item.get("pred_rank_score_20d"))
-        topq       = self._safe_float(item.get("proba_top_quantile_20d"))
-        downside   = self._safe_float(item.get("proba_downside_20d"))
-        blend      = self._safe_float(item.get("blend_score"))
-
-        if rank_score is not None:
-            reasons.append("20일 후 종목 순위 예측 점수가 상위권입니다.")
-        if topq is not None and downside is not None:
-            reasons.append("상위 수익 구간 진입 가능성과 하락 리스크를 함께 고려했습니다.")
-        elif downside is not None:
-            reasons.append("하락 리스크를 반영해 위험조정 관점에서 선별했습니다.")
-        if blend is not None:
-            if blend > 0:
-                reasons.append("위험 대비 종합 점수(블렌드)가 양수입니다.")
-            else:
-                reasons.append("블렌드 점수는 낮지만 유니버스 내 상대 비교에서 상위권입니다.")
-
-        risk   = item.get("risk") or {}
-        rl     = str(risk.get("risk_level") or "").lower()
-        if rl in ["low", "medium"]:
-            reasons.append(f"리스크 등급이 {RISK_LEVEL_LABEL.get(rl, rl)} 수준입니다.")
-        elif rl == "high":
-            reasons.append("리스크는 높지만 기대 순위와 위험 균형에서 상위로 평가됐습니다.")
-
-        news        = item.get("news_brief") or {}
-        confidence  = str(news.get("confidence_level") or "").lower()
-        if confidence in ["high", "medium"]:
-            reasons.append("뉴스 신뢰도가 중간 이상이라 이벤트 기반 신호를 참고할 수 있습니다.")
-        return reasons[:3]
-
-    # ═══════════════════════════════════════════════════════════════════════════
-    # [수정 4+5] _build_markdown_report
-    # — user_level 분기 / 한 줄 요약 우선 / 시장 개요 섹션 / 용어 병기
-    # ═══════════════════════════════════════════════════════════════════════════
-    def _build_markdown_report(self, report: Dict[str, Any], user_level: str = "beginner") -> str:
-        lines  = []
-        meta   = report["meta"]
-        perf   = report.get("performance") or {}
-        selected = meta.get("selected_models") or {}
-
-        rank_model     = selected.get("rank_20d")
-        downside_model = selected.get("downside_20d")
-
-        rank_metrics     = (perf.get("rank_20d")    or {}).get("metrics") or {}
-        downside_metrics = (perf.get("downside_20d") or {}).get("metrics") or {}
-
-        is_beginner  = user_level == "beginner"
-        is_advanced  = user_level == "advanced"
-        level_label  = LEVEL_LABELS.get(user_level, user_level)
-        uid          = meta.get("user_id") or "전체 평균"
-
-        # ── 헤더 ──
-        lines.append(f"# AI 투자 리포트 (as of {meta.get('as_of_date')})")
-        lines.append("")
-        lines.append(f"- 생성 시각(UTC): {meta.get('created_at_utc')}")
-        lines.append(f"- 사용자: {uid}  |  리포트 수준: {level_label}")
-        lines.append(f"- 랭킹 모델: `{rank_model}`  /  하락 리스크 모델: `{downside_model}`")
-        lines.append("")
-
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # [수정 4] 초보 모드: 한 줄 핵심 요약을 가장 먼저 보여줌 (설문 75% 요구)
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        mo = report.get("market_overview") or {}
-        mo_summary = mo.get("summary", "")
-
-        if is_beginner and mo_summary:
-            lines.append("## 📌 오늘의 핵심 한 줄")
-            lines.append("")
-            lines.append(f"> {mo_summary}")
-            lines.append("")
-
-        # ── 1) 요약 ──
-        lines.append("## 1) 요약")
-        lines.append("")
-
-        if is_beginner:
-            # 초보: 숫자 대신 평이한 설명
-            ic  = self._safe_float(rank_metrics.get("SpearmanRankIC"))
-            auc = self._safe_float(downside_metrics.get("AUC"))
-            ic_desc  = "보통" if ic is None else ("좋음" if ic > 0.05 else "보통")
-            auc_desc = "보통" if auc is None else ("좋음" if auc > 0.6 else "보통")
-            lines.append(f"- **종목 순위 예측 품질**: {ic_desc}")
-            lines.append(f"- **하락 종목 감지 능력**: {auc_desc}")
-            lines.append(f"- **분석 종목 수**: {self._safe_metric_int(rank_metrics, 'test_rows')}개")
-        else:
-            lines.append(f"- {self._term('SpearmanRankIC', user_level)}: {self._fmt_num(rank_metrics.get('SpearmanRankIC'), 4)}")
-            lines.append(f"- {self._term('NDCG@10', user_level)}: {self._fmt_num(rank_metrics.get('NDCG@10'), 4)}")
-            lines.append(f"- {self._term('AUC', user_level)}: {self._fmt_num(downside_metrics.get('AUC'), 4)}")
-            lines.append(f"- {self._term('F1', user_level)}: {self._fmt_num(downside_metrics.get('F1'), 4)}")
-
-        lines.append("")
-        lines.append("본 리포트는 확률/기대값 기반 예측이며, 실현 수익을 보장하지 않습니다.")
-        lines.append("")
-
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # [수정 5] 시장 개요 섹션 (market_overview 활용)
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        if mo:
-            lines.append("## 2) 시장 개요")
-            lines.append("")
-            lines.append(f"- **시장 국면**: {mo.get('market_phase', 'N/A')}")
-            lines.append(f"- **시장 톤**: {mo.get('market_tone', 'N/A')}")
-            lines.append(f"- **RSI 상태**: {mo.get('market_rsi_state', 'N/A')}")
-
-            # 수익률 상태
-            ret_state = mo.get("market_return_state") or {}
-            if ret_state:
-                lines.append(
-                    f"- **수익률 흐름**: 20일 {ret_state.get('return_20d_state','N/A')} / "
-                    f"60일 {ret_state.get('return_60d_state','N/A')}"
-                )
-
-            # 집계 지표 (중급 이상만)
-            if not is_beginner:
-                agg = mo.get("aggregate_metrics") or {}
-                if agg:
-                    lines.append(f"- 평균 20D 수익률: {self._fmt_pct(agg.get('avg_return_20d'))}")
-                    lines.append(f"- 평균 연환산 변동성: {self._fmt_pct(agg.get('avg_ann_volatility_252d'))}")
-                    lines.append(f"- 평균 최대낙폭: {self._fmt_pct(agg.get('avg_max_drawdown_252d'))}")
-
-            lines.append("")
-            ev_list = (mo.get("evidence") or [])[:3]
-            if ev_list:
-                lines.append("**시장 근거**")
-                for ev in ev_list:
-                    lines.append(f"- {ev}")
-                lines.append("")
-
-            rn_list = (mo.get("risk_notes") or [])[:2]
-            if rn_list:
-                lines.append("**시장 리스크 노트**")
-                for rn in rn_list:
-                    lines.append(f"- {rn}")
-                lines.append("")
-
-        # ── 3) 모델 성능 (중급/고급만) ──
-        if not is_beginner:
-            lines.append("## 3) 모델 성능")
-            lines.append("")
-            for target, obj in perf.items():
-                lines.append(f"### {target}")
-                lines.append(f"- 선택 모델: `{obj.get('selected_model')}`")
-                metric_obj = obj.get("metrics") or {}
-                for k, v in metric_obj.items():
-                    if isinstance(v, (int, float)):
-                        lines.append(f"- {k}: {self._fmt_num(v, 4)}")
-                lines.append("")
-
-        # ── 유니버스 리스크 개요 ──
-        sec_num = 4 if not is_beginner else 3
-        lines.append(f"## {sec_num}) 유니버스 리스크 개요")
-        lines.append("")
-        risk_counts = (report.get("risk_universe_summary") or {}).get("risk_level_counts")
-        if risk_counts:
-            for k, v in risk_counts.items():
-                icon = RISK_LEVEL_ICON.get(k, "")
-                label = RISK_LEVEL_LABEL.get(k, k)
-                lines.append(f"- {icon} {label}: {v}개")
-        else:
-            lines.append("- risk_score_result.json 집계 정보 없음")
-        lines.append("")
-
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # Top 5 Opportunities
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        sec_num += 1
-        lines.append(f"## {sec_num}) Top 5 추천 종목")
-        lines.append("")
-
-        for rank, item in enumerate(report["recommendations_top5"], 1):
-            ticker = self._zfill6(item["ticker"])
-            lines.append(f"### {rank}. {ticker}")
-            lines.append("")
-
-            # ── [수정 4] 초보 모드: 한 줄 해석 먼저 (market interpretation) ──
-            market = item.get("market_brief") or {}
-            if is_beginner and market.get("interpretation"):
-                lines.append(f"> {market['interpretation']}")
-                lines.append("")
-
-            # ── 수치 지표 ──
-            if is_beginner:
-                # [수정 4] 초보: 용어 설명 병기
-                lines.append(f"- **{self._term('pred_rank_score_20d', 'beginner')}**: {self._fmt_num(item.get('pred_rank_score_20d'), 4)}")
-                lines.append(f"- **{self._term('proba_top_quantile_20d', 'beginner')}**: {self._fmt_pct(item.get('proba_top_quantile_20d'), 2)}")
-                lines.append(f"- **{self._term('proba_downside_20d', 'beginner')}**: {self._fmt_pct(item.get('proba_downside_20d'), 2)}")
-                if item.get("personalized_score_avg") is not None:
-                    lines.append(f"- **나를 위한 추천 점수**: {self._fmt_num(item.get('personalized_score_avg'), 4)}")
-            else:
-                lines.append(f"- 20일 랭킹 예측 점수: {self._fmt_num(item.get('pred_rank_score_20d'), 4)}")
-                lines.append(f"- 20일 랭킹 퍼센타일: {self._fmt_num(item.get('pred_rank_percentile_20d'), 4)}")
-                lines.append(f"- Top 20% 진입 확률: {self._fmt_pct(item.get('proba_top_quantile_20d'), 2)}")
-                lines.append(f"- 20일 하락 리스크 확률: {self._fmt_pct(item.get('proba_downside_20d'), 2)}")
-                lines.append(f"- 개인화 점수 평균: {self._fmt_num(item.get('personalized_score_avg'), 4)}")
-                lines.append(f"- 블렌드 점수: {self._fmt_num(item.get('blend_score'), 4)}")
-            lines.append("")
-
-            # ── [수정 2] 리스크 요약 ──
-            risk = item.get("risk") or {}
-            if risk:
-                rl     = str(risk.get("risk_level") or "").lower()
-                icon   = RISK_LEVEL_ICON.get(rl, "")
-                label  = RISK_LEVEL_LABEL.get(rl, rl)
-                score  = self._fmt_num(risk.get("overall_risk_score"), 2)
-                lines.append("**리스크 요약**")
-                lines.append(f"- 위험 등급: {icon} {label} (종합 점수: {score})")
-                factors = risk.get("dominant_risk_factors") or []
-                if factors:
-                    lines.append(f"- 주요 위험 요인: {', '.join(factors)}")
-                for ev in risk.get("evidence") or []:
-                    lines.append(f"- 근거: {ev}")
-                lines.append("")
-
-            # ── [수정 2] 시장/기술 흐름 — interpretation + positive/risk factors ──
-            if market:
-                lines.append("**시장/기술적 흐름**")
-                if market.get("ticker_type"):
-                    lines.append(f"- 종목 유형: {market['ticker_type']}")
-                if market.get("phase"):
-                    lines.append(f"- 시장 국면: {market['phase']}")
-                if market.get("rsi_state"):
-                    lines.append(f"- RSI 상태: {market['rsi_state']}")
-                if market.get("return_20d") is not None:
-                    state = market.get("return_20d_state", "")
-                    lines.append(f"- 최근 20일 수익률: {self._fmt_pct(market['return_20d'], 2)} ({state})")
-                if market.get("return_60d") is not None:
-                    state = market.get("return_60d_state", "")
-                    lines.append(f"- 최근 60일 수익률: {self._fmt_pct(market['return_60d'], 2)} ({state})")
-                if market.get("ann_volatility_252d") is not None:
-                    lines.append(f"- 연환산 변동성: {self._fmt_pct(market['ann_volatility_252d'], 2)}")
-                if market.get("max_drawdown_252d") is not None:
-                    lines.append(f"- 최대 낙폭: {self._fmt_pct(market['max_drawdown_252d'], 2)}")
-                lines.append("")
-
-                # 긍정 요인
-                pos = market.get("positive_factors") or []
-                if pos:
-                    lines.append("**긍정 요인**")
-                    for p in pos:
-                        lines.append(f"- ✅ {p}")
-                    lines.append("")
-
-                # 리스크 요인
-                rf = market.get("risk_factors") or []
-                if rf:
-                    lines.append("**주의 요인**")
-                    for r in rf:
-                        lines.append(f"- ⚠️ {r}")
-                    lines.append("")
-
-                # 시장 맥락 (중급 이상)
-                if not is_beginner and market.get("market_context"):
-                    lines.append(f"- 시장 맥락: {market['market_context']}")
-                    lines.append("")
-
-            # ── [수정 3] 뉴스/이슈 흐름 — reasons + headline ──
-            news = item.get("news_brief") or {}
-            if news:
-                lines.append("**뉴스/이슈 흐름**")
-                if news.get("news_signal_score") is not None:
-                    lines.append(f"- 뉴스 신호 점수: {self._fmt_num(news.get('news_signal_score'), 2)}")
-                if news.get("confidence_level"):
-                    lines.append(f"- 뉴스 신뢰도: {news['confidence_level']}")
-                if news.get("verdict"):
-                    lines.append(f"- 뉴스 판정: {news['verdict']}")
-                if news.get("n_articles_30d_unique") is not None:
-                    lines.append(f"- 최근 30일 기사 수: {int(news['n_articles_30d_unique'])}")
-
-                # [수정 3] 신호 근거 추가
-                reasons = news.get("reasons") or []
-                if reasons:
-                    lines.append("- 뉴스 신호 근거:")
-                    for r in reasons:
-                        lines.append(f"  - {r}")
-
-                # [수정 3] 대표 기사 헤드라인
-                headline = news.get("top_headline")
-                if headline and headline.get("title"):
-                    lines.append(f"- 대표 기사: [{headline['title']}]({headline.get('url', '#')}) "
-                                 f"({headline.get('press', '')} / {headline.get('date', '')})")
-                lines.append("")
-
-            # ── AI 선정 이유 ──
-            sel_reasons = self._build_selection_reason(item)
-            if sel_reasons:
-                lines.append("**AI 선정 이유**")
-                for r in sel_reasons:
-                    lines.append(f"- {r}")
-                lines.append("")
-
-        # ── Feature Importance (고급만) ──
-        if is_advanced:
-            fi = report.get("feature_importance_top10") or {}
-            if fi:
-                lines.append(f"## {sec_num + 1}) 모델 주요 피처 (고급)")
-                lines.append("")
-                for target, obj in fi.items():
-                    lines.append(f"### {target} — `{obj.get('selected_model')}`")
-                    for feat in (obj.get("top_features") or [])[:5]:
-                        lines.append(f"- {feat['feature']}: {self._fmt_num(feat['importance'], 2)}")
-                    lines.append("")
-
-        # ── Risk Note ──
-        lines.append(f"## Risk Note")
-        lines.append("")
-        lines.append("- 본 결과는 모델 기반 확률/순위 예측이며 수익을 보장하지 않습니다.")
-        lines.append("- 시장 레짐 변화, 실적, 정책, 수급 이벤트에 따라 결과가 달라질 수 있습니다.")
-        lines.append("- 단일 종목 집중보다는 분산 투자, 손절 기준, 리스크 한도를 함께 고려하세요.")
-
-        return "\n".join(lines)
-
-    # ── 내부 유틸 ──────────────────────────────────────────────────────────────
+        return cur
 
     @staticmethod
-    def _safe_metric_int(d: dict, key: str) -> str:
-        v = d.get(key)
-        if v is None:
-            return "N/A"
-        try:
-            return str(int(v))
-        except Exception:
-            return str(v)
+    def _first_non_empty(*values: Any, default: str = "") -> str:
+        for value in values:
+            if value is None:
+                continue
+
+            s = str(value).strip()
+
+            if s:
+                return s
+
+        return default
+
+    @staticmethod
+    def _truncate_text(text: Any, max_len: int = 160) -> str:
+        if text is None:
+            return ""
+
+        s = str(text).strip()
+        s = re.sub(r"\s+", " ", s)
+
+        if len(s) <= max_len:
+            return s
+
+        return s[: max_len - 1].rstrip() + "…"
+
+    def _format_krw(self, value: Any, ndigits: int = 2) -> str:
+        if not self._is_number(value):
+            return "-"
+
+        v = float(value)
+        av = abs(v)
+
+        if av >= 1_0000_0000_0000:
+            return f"{v / 1_0000_0000_0000:.{ndigits}f}조 원"
+
+        if av >= 1_0000_0000:
+            return f"{v / 1_0000_0000:.{ndigits}f}억 원"
+
+        if av >= 1_0000:
+            return f"{v / 1_0000:.{ndigits}f}만 원"
+
+        return f"{v:,.0f}원"
+
+    def _format_number(self, value: Any, ndigits: int = 0) -> str:
+        if not self._is_number(value):
+            return "-"
+
+        if ndigits == 0:
+            return f"{float(value):,.0f}"
+
+        return f"{float(value):,.{ndigits}f}"
+
+    def _format_percent_ratio(
+        self,
+        value: Any,
+        ndigits: int = 2,
+        signed: bool = False,
+    ) -> str:
+        if not self._is_number(value):
+            return "-"
+
+        pct = float(value) * 100
+        sign = "+" if signed and pct > 0 else ""
+
+        return f"{sign}{pct:.{ndigits}f}%"
+
+    def _format_percent_point(self, value: Any, ndigits: int = 2) -> str:
+        if not self._is_number(value):
+            return "-"
+
+        return f"{float(value):.{ndigits}f}%"
+
+    def _format_multiple(self, value: Any, ndigits: int = 2) -> str:
+        if not self._is_number(value):
+            return "-"
+
+        return f"{float(value):.{ndigits}f}배"
+
+    def _format_score(self, value: Any, ndigits: int = 1) -> str:
+        if not self._is_number(value):
+            return "-"
+
+        return f"{float(value):.{ndigits}f}점"
+
+    @staticmethod
+    def _normalize_risk_level(value: Any) -> str:
+        s = str(value or "").strip().lower()
+
+        if s in {"low", "medium", "high", "critical"}:
+            return s
+
+        if s in {"mid", "middle"}:
+            return "medium"
+
+        return "unknown"
+
+    def _risk_level_ko(self, value: Any) -> str:
+        mapping = {
+            "low": "낮음",
+            "medium": "중간",
+            "high": "높음",
+            "critical": "매우 높음",
+            "unknown": "확인 필요",
+        }
+
+        return mapping.get(self._normalize_risk_level(value), "확인 필요")
+
+    @staticmethod
+    def _tone_label_ko(value: Any) -> str:
+        mapping = {
+            "positive": "긍정",
+            "neutral": "중립",
+            "mixed": "혼재",
+            "negative": "부정",
+        }
+
+        return mapping.get(str(value or "").lower(), "혼재")
+
+    def _make_stage_result(
+        self,
+        status: str,
+        message: str,
+        metrics: Optional[Dict[str, Any]] = None,
+        outputs: Optional[Dict[str, Any]] = None,
+    ) -> StageResult:
+        sig = inspect.signature(StageResult)
+
+        candidate_kwargs = {
+            "stage": self.stage,
+            "status": status,
+            "message": message,
+            "metrics": metrics or {},
+            "outputs": outputs or {},
+            "artifacts": outputs or {},
+        }
+
+        kwargs = {
+            k: v
+            for k, v in candidate_kwargs.items()
+            if k in sig.parameters
+        }
+
+        return StageResult(**kwargs)
