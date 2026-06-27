@@ -33,6 +33,7 @@ data/raw/
 data/interim/
 data/processed/
 artifacts/
+experiment_runs/
 *.csv
 *.tsv
 *.parquet

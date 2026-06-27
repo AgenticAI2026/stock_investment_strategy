@@ -5,6 +5,7 @@ import inspect
 import json
 import os
 import re
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -19,7 +20,7 @@ from core.artifacts import ArtifactPaths
 
 class ReportGenerativeAgent(BaseAgent):
     stage = "report_generation"
-    version = "1.0.0"
+    version = "1.1.0"
 
     COMPONENT_LABELS = {
         "market_flow_alignment_score": "시장 흐름 연관도",
@@ -32,6 +33,14 @@ class ReportGenerativeAgent(BaseAgent):
         "user_interest_boost": "사용자 관심 반영",
     }
 
+    RELEVANCE_LABELS = {
+        "direct_company_news": "기업 직접 뉴스",
+        "direct_business_relation": "사업 관계 뉴스",
+        "indirect_mention": "간접 언급",
+        "market_context": "시장 맥락",
+        "low_relevance": "낮은 관련도",
+    }
+
     def __init__(
         self,
         gemini_model_name: str = "gemini-2.5-flash",
@@ -40,6 +49,7 @@ class ReportGenerativeAgent(BaseAgent):
         use_llm: bool = True,
         encoding: str = "utf-8",
         max_news_per_candidate: int = 3,
+        max_source_grounded_evidence_per_candidate: int = 3,
         model_name: Optional[str] = None,
     ):
         if model_name is not None:
@@ -51,6 +61,7 @@ class ReportGenerativeAgent(BaseAgent):
         self.use_llm = use_llm
         self.encoding = encoding
         self.max_news_per_candidate = max_news_per_candidate
+        self.max_source_grounded_evidence_per_candidate = max_source_grounded_evidence_per_candidate
 
     def execute(self, ctx: RunContext, ap: ArtifactPaths) -> StageResult:
         return self.run(ctx, ap)
@@ -139,15 +150,31 @@ class ReportGenerativeAgent(BaseAgent):
 
         self._save_json(manifest, manifest_path)
 
+        candidates = self._safe_get(report, "candidate_section.candidates", default=[])
+
         metrics = {
             "is_valid": is_valid,
             "n_warnings": len(warnings),
-            "n_candidates": len(
-                self._safe_get(report, "candidate_section.candidates", default=[])
-            ),
+            "n_candidates": len(candidates),
             "as_of_date": self._safe_get(report, "report_meta.as_of_date"),
             "llm_used": llm_status.get("used"),
             "llm_provider": llm_status.get("provider"),
+            "n_candidates_with_source_grounding": sum(
+                1
+                for c in candidates
+                if isinstance(c, dict)
+                and self._safe_get(c, "source_grounding.evidence_count", default=0) > 0
+            ),
+            "n_source_grounded_evidence": self._safe_get(
+                report,
+                "source_grounding_summary.source_grounded_evidence_count",
+                default=0,
+            ),
+            "rag_enabled": self._safe_get(
+                report,
+                "source_grounding_summary.rag_enabled",
+                default=False,
+            ),
         }
 
         outputs = {
@@ -160,7 +187,10 @@ class ReportGenerativeAgent(BaseAgent):
             for warning in warnings:
                 ctx.logger.warning(f"[ReportGenerativeAgent] {warning}")
 
-        ctx.logger.info("[ReportGenerativeAgent] Completed report generation.")
+        ctx.logger.info(
+            "[ReportGenerativeAgent] Completed report generation. "
+            f"source_grounded_evidence={metrics['n_source_grounded_evidence']}"
+        )
 
         return self._make_stage_result(
             status="success",
@@ -206,6 +236,8 @@ class ReportGenerativeAgent(BaseAgent):
         if not isinstance(llm_candidates, dict):
             llm_candidates = {}
 
+        source_grounding_summary = self._build_source_grounding_summary(evidence)
+
         candidate_cards = []
 
         for item in sorted(top10, key=lambda x: x.get("rank", 999)):
@@ -245,6 +277,18 @@ class ReportGenerativeAgent(BaseAgent):
                 "ranking_target": report_context.get("ranking_target"),
                 "ranking_scope": report_context.get("ranking_scope"),
                 "candidate_definition": report_context.get("candidate_definition", {}),
+                "evidence_grounding": {
+                    "rag_enabled": source_grounding_summary.get("rag_enabled"),
+                    "source_grounded_evidence_count": source_grounding_summary.get(
+                        "source_grounded_evidence_count"
+                    ),
+                    "description": (
+                        "Ours B에서는 수집 뉴스 corpus 기반 RAG evidence가 "
+                        "종목별 근거로 함께 반영됩니다."
+                        if source_grounding_summary.get("rag_enabled")
+                        else "RAG 기반 source-grounded evidence는 사용되지 않았습니다."
+                    ),
+                },
             },
             "ui_contract": {
                 "layout": "market_summary_then_candidate_cards_then_glossary",
@@ -255,12 +299,15 @@ class ReportGenerativeAgent(BaseAgent):
                     "ActualDataTable",
                     "NewsList",
                     "EntryReasonBox",
+                    "SourceGroundedEvidenceList",
                     "GlossarySection",
                 ],
                 "frontend_notes": [
                     "chart.series.price는 차트 렌더링에 사용합니다.",
                     "actual_data.items는 표 형태로 표시합니다.",
                     "top_news.url은 뉴스 링크 버튼에 연결합니다.",
+                    "source_grounded_evidence는 RAG로 검증된 뉴스 근거입니다.",
+                    "source_grounding.evidence_count가 0이면 근거 검증 배지를 숨길 수 있습니다.",
                     "is_missing=true인 데이터는 '-' 또는 '데이터 없음'으로 표시합니다.",
                     "이 리포트는 투자 추천이 아니라 관심 후보 설명 리포트입니다.",
                 ],
@@ -274,11 +321,17 @@ class ReportGenerativeAgent(BaseAgent):
                     "정보성 리포트입니다. 특정 종목의 매수·매도 추천, 수익률 예측, "
                     "수익 보장을 의미하지 않습니다."
                 ),
+                "source_grounding_note": (
+                    "뉴스 근거는 수집된 뉴스 corpus 안에서 검색·검증된 자료를 기반으로 하며, "
+                    "실시간 외부 웹 검색 결과가 아닙니다."
+                ),
             },
             "market_summary": self._build_market_summary(
                 evidence=evidence,
                 llm_market_text=llm_market_text,
+                source_grounding_summary=source_grounding_summary,
             ),
+            "source_grounding_summary": source_grounding_summary,
             "candidate_section": {
                 "title": "유망 + 관심 종목 후보 TOP 10",
                 "subtitle": "오늘 시장 흐름과 데이터상 관심 있게 확인할 만한 종목 후보입니다.",
@@ -307,12 +360,15 @@ class ReportGenerativeAgent(BaseAgent):
         self,
         evidence: Dict[str, Any],
         llm_market_text: Optional[Dict[str, Any]] = None,
+        source_grounding_summary: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         market_context = evidence.get("market_context", {}) or {}
         summary_box = market_context.get("report_summary_box", {}) or {}
 
         if not isinstance(llm_market_text, dict):
             llm_market_text = self._fallback_market_text(market_context)
+
+        source_grounding_summary = source_grounding_summary or self._build_source_grounding_summary(evidence)
 
         return {
             "title": summary_box.get("title", "오늘 시장 한 줄 요약"),
@@ -332,6 +388,24 @@ class ReportGenerativeAgent(BaseAgent):
             "core_drivers": market_context.get("core_market_drivers", []),
             "risk_notes": market_context.get("market_risk_notes", []),
             "raw_market_brief": market_context.get("market_brief"),
+            "source_grounding": {
+                "rag_enabled": source_grounding_summary.get("rag_enabled"),
+                "source_grounded_evidence_count": source_grounding_summary.get(
+                    "source_grounded_evidence_count"
+                ),
+                "candidate_coverage_count": source_grounding_summary.get(
+                    "candidate_coverage_count"
+                ),
+                "evidence_relevance_counts": source_grounding_summary.get(
+                    "evidence_relevance_counts",
+                    {},
+                ),
+                "note": (
+                    "일부 종목 설명에는 RAG로 검증된 뉴스 근거가 함께 연결되어 있습니다."
+                    if source_grounding_summary.get("source_grounded_evidence_count", 0) > 0
+                    else "이번 리포트에는 RAG로 연결된 뉴스 근거가 없습니다."
+                ),
+            },
         }
 
     def _build_candidate_card(
@@ -347,6 +421,18 @@ class ReportGenerativeAgent(BaseAgent):
         actual_data = item.get("actual_data", {}) or {}
         chart_data = item.get("chart_data", {}) or {}
         component_scores = item.get("component_scores", {}) or {}
+
+        source_grounded_evidence = self._build_source_grounded_evidence_items(
+            item.get("source_grounded_evidence", []) or []
+        )
+        rag_supported_claims = self._build_rag_supported_claim_items(
+            item.get("rag_supported_claims", []) or []
+        )
+        source_grounding_payload = self._build_candidate_source_grounding_payload(
+            item=item,
+            source_grounded_evidence=source_grounded_evidence,
+            rag_supported_claims=rag_supported_claims,
+        )
 
         return {
             "rank": rank,
@@ -380,7 +466,15 @@ class ReportGenerativeAgent(BaseAgent):
                     "ranking_reason.supporting_reasons",
                     default=[],
                 ),
+                "source_grounded_note": self._truncate_text(
+                    llm_candidate_text.get("grounded_evidence_note")
+                    or source_grounding_payload.get("headline"),
+                    180,
+                ),
             },
+            "source_grounding": source_grounding_payload,
+            "source_grounded_evidence": source_grounded_evidence,
+            "rag_supported_claims": rag_supported_claims,
             "positive_evidence": item.get("positive_evidence", [])[:5],
             "negative_evidence": item.get("negative_evidence", [])[:5],
             "caution": {
@@ -395,9 +489,207 @@ class ReportGenerativeAgent(BaseAgent):
                 "market_analysis": item.get("market_analysis_snapshot", {}),
                 "news_signal": item.get("news_signal_snapshot", {}),
                 "risk": item.get("risk_snapshot", {}),
+                "rag_evidence": item.get("rag_evidence_snapshot", {}),
             },
             "data_quality": item.get("data_quality", {}),
         }
+
+    # ============================================================
+    # Source-grounded evidence
+    # ============================================================
+
+    def _build_source_grounding_summary(self, evidence: Dict[str, Any]) -> Dict[str, Any]:
+        rag_summary = evidence.get("rag_evidence_summary", {}) or {}
+        source_grounded_evidence = evidence.get("source_grounded_evidence", []) or []
+        top10 = evidence.get("top10_evidence", []) or []
+
+        relevance_counts = Counter()
+
+        for ev in source_grounded_evidence:
+            if isinstance(ev, dict) and ev.get("evidence_relevance"):
+                relevance_counts[ev.get("evidence_relevance")] += 1
+
+        candidate_coverage = []
+
+        for item in top10:
+            if not isinstance(item, dict):
+                continue
+
+            sg = item.get("source_grounded_evidence", []) or []
+
+            candidate_coverage.append(
+                {
+                    "rank": item.get("rank"),
+                    "ticker": item.get("ticker"),
+                    "company_name": item.get("company_name"),
+                    "source_grounded_evidence_count": len(sg),
+                    "status": "supported" if sg else "no_verified_rag_evidence",
+                }
+            )
+
+        return {
+            "rag_enabled": bool(
+                rag_summary.get("rag_enabled")
+                or source_grounded_evidence
+            ),
+            "rag_method": rag_summary.get("rag_method"),
+            "retrieval_query_count": rag_summary.get("retrieval_query_count"),
+            "retrieved_evidence_count": rag_summary.get("retrieved_evidence_count"),
+            "source_grounded_evidence_count": len(source_grounded_evidence),
+            "candidate_coverage_count": sum(
+                1
+                for item in candidate_coverage
+                if item.get("source_grounded_evidence_count", 0) > 0
+            ),
+            "candidate_count": len(candidate_coverage),
+            "evidence_relevance_counts": dict(relevance_counts),
+            "evidence_relevance_labels": {
+                key: self.RELEVANCE_LABELS.get(key, key)
+                for key in relevance_counts.keys()
+            },
+            "candidate_coverage": candidate_coverage,
+            "raw_rag_evidence_summary": rag_summary,
+        }
+
+    def _build_source_grounded_evidence_items(
+        self,
+        raw_evidence: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        result = []
+
+        if not isinstance(raw_evidence, list):
+            return result
+
+        for idx, ev in enumerate(raw_evidence[: self.max_source_grounded_evidence_per_candidate]):
+            if not isinstance(ev, dict):
+                continue
+
+            relevance = ev.get("evidence_relevance")
+
+            result.append(
+                {
+                    "order": idx + 1,
+                    "support_type": ev.get("support_type") or "rag_verified_news",
+                    "support_type_label": "뉴스 근거",
+                    "ticker": ev.get("ticker"),
+                    "company_name": ev.get("company_name"),
+                    "claim": ev.get("claim"),
+                    "evidence_relevance": relevance,
+                    "evidence_relevance_label": self.RELEVANCE_LABELS.get(
+                        relevance,
+                        relevance or "확인 필요",
+                    ),
+                    "directness_score": self._round_or_none(ev.get("directness_score"), 3),
+                    "final_score": self._round_or_none(ev.get("final_score"), 3),
+                    "retrieval_score": self._round_or_none(ev.get("retrieval_score"), 3),
+                    "event_hits": ev.get("event_hits", []) or [],
+                    "verification_reasons": ev.get("verification_reasons", []) or [],
+                    "source": {
+                        "title": ev.get("title"),
+                        "press": ev.get("press"),
+                        "published_at": ev.get("published_at"),
+                        "url": ev.get("url"),
+                        "source_path": ev.get("source_path"),
+                        "doc_id": ev.get("doc_id"),
+                    },
+                    "summary": self._truncate_text(
+                        self._first_non_empty(
+                            ev.get("summary_optional"),
+                            ev.get("claim"),
+                            ev.get("title"),
+                            default="뉴스 근거가 확인되었습니다.",
+                        ),
+                        180,
+                    ),
+                }
+            )
+
+        return result
+
+    def _build_rag_supported_claim_items(
+        self,
+        raw_claims: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        result = []
+
+        if not isinstance(raw_claims, list):
+            return result
+
+        for idx, claim in enumerate(raw_claims[: self.max_source_grounded_evidence_per_candidate]):
+            if not isinstance(claim, dict):
+                continue
+
+            relevance = claim.get("evidence_relevance")
+
+            result.append(
+                {
+                    "order": idx + 1,
+                    "ticker": claim.get("ticker"),
+                    "company_name": claim.get("company_name"),
+                    "claim": claim.get("claim"),
+                    "support_type": claim.get("support_type"),
+                    "evidence_relevance": relevance,
+                    "evidence_relevance_label": self.RELEVANCE_LABELS.get(
+                        relevance,
+                        relevance or "확인 필요",
+                    ),
+                    "source_title": claim.get("source_title"),
+                    "source_press": claim.get("source_press"),
+                    "source_url": claim.get("source_url"),
+                    "directness_score": self._round_or_none(claim.get("directness_score"), 3),
+                }
+            )
+
+        return result
+
+    def _build_candidate_source_grounding_payload(
+        self,
+        item: Dict[str, Any],
+        source_grounded_evidence: List[Dict[str, Any]],
+        rag_supported_claims: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        evidence_count = len(source_grounded_evidence)
+        relevance_counts = Counter(
+            ev.get("evidence_relevance")
+            for ev in source_grounded_evidence
+            if ev.get("evidence_relevance")
+        )
+
+        if evidence_count > 0:
+            first = source_grounded_evidence[0]
+            headline = self._first_non_empty(
+                first.get("claim"),
+                self._safe_get(first, "source.title"),
+                default="검증된 뉴스 근거가 확인되었습니다.",
+            )
+        else:
+            headline = "검증된 뉴스 근거는 별도로 확인되지 않았습니다."
+
+        return {
+            "status": "supported" if evidence_count > 0 else "no_verified_rag_evidence",
+            "evidence_count": evidence_count,
+            "claim_count": len(rag_supported_claims),
+            "headline": self._truncate_text(headline, 180),
+            "relevance_counts": dict(relevance_counts),
+            "relevance_labels": {
+                key: self.RELEVANCE_LABELS.get(key, key)
+                for key in relevance_counts.keys()
+            },
+            "display_badge": (
+                "근거 확인"
+                if evidence_count > 0
+                else "근거 제한"
+            ),
+            "frontend_hint": {
+                "show_source_grounding_box": evidence_count > 0,
+                "show_source_links": evidence_count > 0,
+                "preferred_section_title": "확인된 뉴스 근거",
+            },
+        }
+
+    # ============================================================
+    # UI payload builders
+    # ============================================================
 
     def _build_chart_payload(self, chart_data: Dict[str, Any]) -> Dict[str, Any]:
         price_series = chart_data.get("recent_price_series", []) or []
@@ -640,6 +932,8 @@ class ReportGenerativeAgent(BaseAgent):
                 default="관련 뉴스가 확인되었습니다.",
             )
 
+            relevance = news.get("evidence_relevance")
+
             result.append(
                 {
                     "order": idx + 1,
@@ -650,6 +944,18 @@ class ReportGenerativeAgent(BaseAgent):
                     "summary": self._truncate_text(summary, 120),
                     "article_score": news.get("article_score"),
                     "rule_score_0_1": news.get("rule_score_0_1"),
+
+                    # RAG metadata
+                    "source_type": news.get("source_type") or "internal_news",
+                    "support_type": news.get("support_type"),
+                    "is_source_grounded": news.get("support_type") == "rag_verified_news",
+                    "evidence_relevance": relevance,
+                    "evidence_relevance_label": self.RELEVANCE_LABELS.get(
+                        relevance,
+                        relevance,
+                    ),
+                    "directness_score": self._round_or_none(news.get("directness_score"), 3),
+                    "verification_reasons": news.get("verification_reasons"),
                 }
             )
 
@@ -677,7 +983,12 @@ class ReportGenerativeAgent(BaseAgent):
         }
 
     def _build_glossary(self, evidence: Dict[str, Any]) -> List[Dict[str, Any]]:
-        raw_glossary = evidence.get("glossary") or evidence.get("terms_glossary") or []
+        raw_glossary = (
+            evidence.get("glossary")
+            or evidence.get("terms_glossary")
+            or evidence.get("glossary_terms")
+            or []
+        )
         result = []
 
         if isinstance(raw_glossary, list):
@@ -725,6 +1036,11 @@ class ReportGenerativeAgent(BaseAgent):
                 "term": "리스크 점수",
                 "description": "변동성, 낙폭, 재무 부담, 뉴스 이벤트 등을 종합한 위험도 점수입니다.",
                 "why_it_matters": "점수가 높을수록 가격 흔들림이나 불확실성에 더 주의해야 합니다.",
+            },
+            {
+                "term": "뉴스 근거",
+                "description": "수집된 뉴스 데이터 안에서 해당 종목과 관련성이 확인된 기사입니다.",
+                "why_it_matters": "종목 설명이 단순 추정이 아니라 어떤 기사 흐름에 기반하는지 확인할 때 참고합니다.",
             },
         ]
 
@@ -863,7 +1179,7 @@ class ReportGenerativeAgent(BaseAgent):
                     "content": (
                         "You are a Korean financial report generation agent. "
                         "Return only valid JSON. Do not invent facts. "
-                        "Do not change rankings, scores, numbers, or URLs."
+                        "Do not change rankings, scores, numbers, news titles, or URLs."
                     ),
                 },
                 {
@@ -884,6 +1200,7 @@ class ReportGenerativeAgent(BaseAgent):
     def _build_llm_prompt(self, evidence: Dict[str, Any]) -> str:
         market_context = evidence.get("market_context", {}) or {}
         top10 = evidence.get("top10_evidence", []) or []
+        source_grounding_summary = self._build_source_grounding_summary(evidence)
 
         compact_candidates = []
 
@@ -897,6 +1214,24 @@ class ReportGenerativeAgent(BaseAgent):
                 {},
             )
 
+            source_grounded_evidence = []
+
+            for ev in item.get("source_grounded_evidence", [])[:3]:
+                if not isinstance(ev, dict):
+                    continue
+
+                source_grounded_evidence.append(
+                    {
+                        "claim": ev.get("claim"),
+                        "evidence_relevance": ev.get("evidence_relevance"),
+                        "title": ev.get("title"),
+                        "press": ev.get("press"),
+                        "published_at": ev.get("published_at"),
+                        "event_hits": ev.get("event_hits", [])[:5],
+                        "directness_score": ev.get("directness_score"),
+                    }
+                )
+
             compact_candidates.append(
                 {
                     "rank": item.get("rank"),
@@ -905,7 +1240,7 @@ class ReportGenerativeAgent(BaseAgent):
                     "score": item.get("market_flow_candidate_score"),
                     "risk_level": actual_data.get("risk_level"),
                     "main_reason": ranking_reason.get("main_reason"),
-                    "supporting_reasons": ranking_reason.get("supporting_reasons", [])[:5],
+                    "supporting_reasons": ranking_reason.get("supporting_reasons", [])[:6],
                     "beginner_explanation": ranking_reason.get("beginner_explanation"),
                     "caution_note": ranking_reason.get("caution_note"),
                     "positive_evidence": item.get("positive_evidence", [])[:5],
@@ -925,10 +1260,14 @@ class ReportGenerativeAgent(BaseAgent):
                             "title": n.get("title"),
                             "summary_optional": n.get("summary_optional"),
                             "published_at": n.get("published_at"),
+                            "source_type": n.get("source_type"),
+                            "evidence_relevance": n.get("evidence_relevance"),
                         }
                         for n in item.get("top_news_3", [])[:3]
                         if isinstance(n, dict)
                     ],
+                    "source_grounded_evidence": source_grounded_evidence,
+                    "rag_evidence_snapshot": item.get("rag_evidence_snapshot", {}),
                 }
             )
 
@@ -942,6 +1281,16 @@ class ReportGenerativeAgent(BaseAgent):
                 "market_phase": market_context.get("market_phase"),
                 "market_tone": market_context.get("market_tone"),
                 "market_risk_notes": market_context.get("market_risk_notes", []),
+            },
+            "source_grounding_summary": {
+                "rag_enabled": source_grounding_summary.get("rag_enabled"),
+                "source_grounded_evidence_count": source_grounding_summary.get(
+                    "source_grounded_evidence_count"
+                ),
+                "evidence_relevance_counts": source_grounding_summary.get(
+                    "evidence_relevance_counts",
+                    {},
+                ),
             },
             "candidates": compact_candidates,
         }
@@ -957,6 +1306,7 @@ class ReportGenerativeAgent(BaseAgent):
                     "quick_summary": "종목 카드 상단 1문장 요약",
                     "entry_reason": "순위 진입 이유 1~2문장",
                     "caution_note": "주의사항 1문장",
+                    "grounded_evidence_note": "뉴스 근거가 있으면 이를 자연스럽게 요약한 1문장",
                     "news_summaries": [
                         "뉴스 1 카드용 요약",
                         "뉴스 2 카드용 요약",
@@ -978,6 +1328,9 @@ class ReportGenerativeAgent(BaseAgent):
 5. 리스크는 반드시 함께 언급해.
 6. 초보 투자자가 이해하기 쉽게 써.
 7. 후보별 candidates의 key는 반드시 ticker 값으로 사용해.
+8. source_grounded_evidence가 있는 후보는 entry_reason 또는 grounded_evidence_note에 해당 뉴스 근거를 자연스럽게 반영해.
+9. 내부 용어인 RAG, directness_score, retrieval_score는 사용자용 문장에 직접 쓰지 마. 대신 '확인된 뉴스 근거', '관련 기사', '사업 관계 뉴스'처럼 자연스럽게 표현해.
+10. source_grounded_evidence가 없는 후보에 대해 근거가 확인됐다고 말하지 마.
 
 반환 스키마:
 {json.dumps(output_schema, ensure_ascii=False, indent=2)}
@@ -1045,6 +1398,7 @@ class ReportGenerativeAgent(BaseAgent):
         actual_data = item.get("actual_data", {}) or {}
         score_basis = self._safe_get(item, "ranking_reason.score_basis", {})
         top_components = score_basis.get("top_component_scores", []) or []
+        source_grounded_evidence = item.get("source_grounded_evidence", []) or []
 
         if top_components:
             labels = [
@@ -1057,12 +1411,26 @@ class ReportGenerativeAgent(BaseAgent):
         else:
             quick_summary = f"{company_name}은 현재 시장 흐름에서 관심 있게 확인할 만한 후보입니다."
 
+        grounded_note = ""
+
+        if source_grounded_evidence:
+            first_ev = source_grounded_evidence[0]
+            grounded_note = self._first_non_empty(
+                first_ev.get("claim"),
+                first_ev.get("title"),
+                default="관련 뉴스 근거가 확인되었습니다.",
+            )
+
         entry_reason = self._first_non_empty(
             ranking_reason.get("beginner_explanation"),
             ranking_reason.get("main_reason"),
             ranking_reason.get("original_ranking_reason_short"),
+            grounded_note,
             default=quick_summary,
         )
+
+        if grounded_note and grounded_note not in entry_reason:
+            entry_reason = f"{entry_reason} 또한 {grounded_note}"
 
         caution_note = self._first_non_empty(
             ranking_reason.get("caution_note"),
@@ -1079,9 +1447,15 @@ class ReportGenerativeAgent(BaseAgent):
             if not isinstance(news, dict):
                 continue
 
+            prefix = ""
+
+            if news.get("support_type") == "rag_verified_news":
+                prefix = "확인된 뉴스 근거: "
+
             news_summaries.append(
                 self._truncate_text(
-                    self._first_non_empty(
+                    prefix
+                    + self._first_non_empty(
                         news.get("summary_optional"),
                         news.get("title"),
                         default="관련 뉴스가 확인되었습니다.",
@@ -1094,6 +1468,7 @@ class ReportGenerativeAgent(BaseAgent):
             "quick_summary": self._truncate_text(quick_summary, 120),
             "entry_reason": self._truncate_text(entry_reason, 240),
             "caution_note": self._truncate_text(caution_note, 180),
+            "grounded_evidence_note": self._truncate_text(grounded_note, 180),
             "news_summaries": news_summaries,
         }
 
@@ -1113,6 +1488,7 @@ class ReportGenerativeAgent(BaseAgent):
         llm_status: Dict[str, Any],
     ) -> Dict[str, Any]:
         candidates = self._safe_get(report, "candidate_section.candidates", default=[])
+        source_grounding_summary = report.get("source_grounding_summary", {}) or {}
 
         return {
             "agent": self.__class__.__name__,
@@ -1138,6 +1514,13 @@ class ReportGenerativeAgent(BaseAgent):
                 "n_candidates": len(candidates),
                 "is_valid": is_valid,
                 "warnings": warnings,
+                "rag_enabled": source_grounding_summary.get("rag_enabled"),
+                "source_grounded_evidence_count": source_grounding_summary.get(
+                    "source_grounded_evidence_count"
+                ),
+                "candidate_coverage_count": source_grounding_summary.get(
+                    "candidate_coverage_count"
+                ),
                 "candidates": [
                     {
                         "rank": c.get("rank"),
@@ -1146,6 +1529,11 @@ class ReportGenerativeAgent(BaseAgent):
                         "score": c.get("score"),
                         "risk_level": self._safe_get(c, "risk.level"),
                         "news_count": len(c.get("top_news", [])),
+                        "source_grounded_evidence_count": self._safe_get(
+                            c,
+                            "source_grounding.evidence_count",
+                            default=0,
+                        ),
                         "chart_points": len(
                             self._safe_get(c, "chart.series.price", default=[])
                         ),
@@ -1188,6 +1576,12 @@ class ReportGenerativeAgent(BaseAgent):
 
             if not self._safe_get(c, "actual_data.items", default=[]):
                 warnings.append(f"{ticker} actual_data.items가 비어 있습니다.")
+
+            source_grounding = c.get("source_grounding", {}) or {}
+            sg_count = source_grounding.get("evidence_count", 0)
+
+            if sg_count > 0 and not c.get("source_grounded_evidence"):
+                warnings.append(f"{ticker} source_grounding count는 있으나 source_grounded_evidence가 비어 있습니다.")
 
         return len(warnings) == 0, warnings
 
@@ -1260,6 +1654,13 @@ class ReportGenerativeAgent(BaseAgent):
     def _round_or_none(self, value: Any, ndigits: int = 3) -> Optional[float]:
         if self._is_number(value):
             return round(float(value), ndigits)
+
+        try:
+            if value is not None and str(value).strip() != "":
+                return round(float(value), ndigits)
+        except Exception:
+            pass
+
         return None
 
     @staticmethod
@@ -1305,7 +1706,10 @@ class ReportGenerativeAgent(BaseAgent):
 
     def _format_krw(self, value: Any, ndigits: int = 2) -> str:
         if not self._is_number(value):
-            return "-"
+            try:
+                value = float(value)
+            except Exception:
+                return "-"
 
         v = float(value)
         av = abs(v)
@@ -1323,7 +1727,10 @@ class ReportGenerativeAgent(BaseAgent):
 
     def _format_number(self, value: Any, ndigits: int = 0) -> str:
         if not self._is_number(value):
-            return "-"
+            try:
+                value = float(value)
+            except Exception:
+                return "-"
 
         if ndigits == 0:
             return f"{float(value):,.0f}"
@@ -1337,7 +1744,10 @@ class ReportGenerativeAgent(BaseAgent):
         signed: bool = False,
     ) -> str:
         if not self._is_number(value):
-            return "-"
+            try:
+                value = float(value)
+            except Exception:
+                return "-"
 
         pct = float(value) * 100
         sign = "+" if signed and pct > 0 else ""
@@ -1346,19 +1756,28 @@ class ReportGenerativeAgent(BaseAgent):
 
     def _format_percent_point(self, value: Any, ndigits: int = 2) -> str:
         if not self._is_number(value):
-            return "-"
+            try:
+                value = float(value)
+            except Exception:
+                return "-"
 
         return f"{float(value):.{ndigits}f}%"
 
     def _format_multiple(self, value: Any, ndigits: int = 2) -> str:
         if not self._is_number(value):
-            return "-"
+            try:
+                value = float(value)
+            except Exception:
+                return "-"
 
         return f"{float(value):.{ndigits}f}배"
 
     def _format_score(self, value: Any, ndigits: int = 1) -> str:
         if not self._is_number(value):
-            return "-"
+            try:
+                value = float(value)
+            except Exception:
+                return "-"
 
         return f"{float(value):.{ndigits}f}점"
 
