@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from collections import Counter, defaultdict
 
 import pandas as pd
 
@@ -23,6 +24,13 @@ class EvidenceBuilderConfig:
     output_dir_name: str = "report_evidence"
     output_json_name: str = "report_evidence_result.json"
     manifest_name: str = "manifest.json"
+
+    # RAG evidence handling
+    rag_top_k_per_candidate: int = 3
+    rag_allowed_relevance: Tuple[str, ...] = (
+        "direct_company_news",
+        "direct_business_relation",
+    )
 
 
 @dataclass
@@ -43,10 +51,12 @@ class ReportEvidenceBuilderAgent(BaseAgent):
     - LLM 사용 안 함
     - 입력 데이터에 없는 수치/뉴스/근거 생성 안 함
     - 누락 필드는 null과 data_quality.missing_fields에 기록
+    - Ours B에서는 NewsInvestigationAgent의 RAG evidence를
+      source_grounded_evidence로 명시적으로 연결
     """
 
     stage = "report_evidence_builder"
-    version = "1.0.0"
+    version = "1.1.0"
 
     def __init__(
         self,
@@ -79,7 +89,29 @@ class ReportEvidenceBuilderAgent(BaseAgent):
         candidate_result = self._load_json_required(paths["candidate_scoring_result"], ctx)
         market_flow_result = self._load_json_optional(paths.get("market_flow_result"), ctx)
         market_analysis_result = self._load_json_optional(paths.get("market_analysis_result"), ctx)
-        news_result = self._load_json_optional(paths.get("news_invest_result"), ctx)
+
+        # ----------------------------------------------------
+        # NewsInvestigation 결과 로드
+        # 1. ctx.analysis_outputs.news_investigation 우선
+        # 2. news_invest_result.json
+        # 3. news_rag_result.json은 RAG payload로 별도 병합
+        # ----------------------------------------------------
+        analysis_outputs = self._ctx_get(ctx, "analysis_outputs", {}) or {}
+
+        news_result_from_ctx = {}
+        if isinstance(analysis_outputs, dict):
+            maybe_news = analysis_outputs.get("news_investigation")
+            if isinstance(maybe_news, dict):
+                news_result_from_ctx = maybe_news
+
+        news_result_file = self._load_json_optional(paths.get("news_invest_result"), ctx)
+        news_rag_payload_file = self._load_json_optional(paths.get("news_rag_result"), ctx)
+
+        news_result = self._merge_news_and_rag_payload(
+            primary_news_result=news_result_from_ctx or news_result_file,
+            rag_payload=news_rag_payload_file,
+        )
+
         risk_result = self._load_json_optional(paths.get("risk_score_result"), ctx)
 
         ohlcv_df = self._load_csv_optional(paths.get("ohlcv"), ctx)
@@ -95,6 +127,8 @@ class ReportEvidenceBuilderAgent(BaseAgent):
         finance_map = self._build_latest_row_map(finance_df, date_col="year")
         foreign_map = self._build_latest_row_map(foreign_df, date_col="date")
 
+        rag_evidence_map = self._build_rag_evidence_map(news_result)
+
         top_candidates = candidate_result.get("top10_candidates", [])[: self.config.top_k]
         evidence_items = []
 
@@ -106,6 +140,24 @@ class ReportEvidenceBuilderAgent(BaseAgent):
             risk_item = risk_map.get(ticker, {})
             finance_item = finance_map.get(ticker, {})
             foreign_item = foreign_map.get(ticker, {})
+
+            rag_evidence = self._select_rag_evidence_for_ticker(
+                ticker=ticker,
+                rag_evidence_map=rag_evidence_map,
+                max_evidence=self.config.rag_top_k_per_candidate,
+            )
+
+            source_grounded_evidence = self._build_source_grounded_evidence(
+                ticker=ticker,
+                candidate=candidate,
+                rag_evidence=rag_evidence,
+            )
+
+            rag_supported_claims = self._build_rag_supported_claims(
+                ticker=ticker,
+                candidate=candidate,
+                source_grounded_evidence=source_grounded_evidence,
+            )
 
             chart_data = self._build_chart_data(ticker, ohlcv_df, self.config.chart_window)
             latest_price_row = chart_data.get("latest_row", {})
@@ -123,6 +175,7 @@ class ReportEvidenceBuilderAgent(BaseAgent):
                 candidate=candidate,
                 news_item=news_item,
                 raw_news_df=raw_news_df,
+                rag_evidence=rag_evidence,
                 max_news=3,
             )
 
@@ -130,12 +183,14 @@ class ReportEvidenceBuilderAgent(BaseAgent):
                 candidate=candidate,
                 market_item=market_item,
                 risk_item=risk_item,
+                rag_supported_claims=rag_supported_claims,
             )
 
             data_quality = self._build_data_quality(
                 actual_data=actual_data,
                 chart_data=chart_data,
                 top_news_3=top_news_3,
+                source_grounded_evidence=source_grounded_evidence,
             )
 
             evidence_items.append(
@@ -151,7 +206,16 @@ class ReportEvidenceBuilderAgent(BaseAgent):
                         "component_scores": candidate.get("component_scores", {}),
                         "chart_data": self._strip_internal_chart_fields(chart_data),
                         "actual_data": actual_data,
+
                         "top_news_3": top_news_3,
+
+                        "source_grounded_evidence": source_grounded_evidence,
+                        "rag_supported_claims": rag_supported_claims,
+                        "rag_evidence_snapshot": self._build_rag_evidence_snapshot(
+                            rag_evidence=rag_evidence,
+                            source_grounded_evidence=source_grounded_evidence,
+                        ),
+
                         "ranking_reason": ranking_reason,
                         "positive_evidence": candidate.get("positive_evidence", []),
                         "negative_evidence": candidate.get("negative_evidence", []),
@@ -169,6 +233,8 @@ class ReportEvidenceBuilderAgent(BaseAgent):
                 )
             )
 
+        all_source_grounded_evidence = self._flatten_source_grounded_evidence(evidence_items)
+
         result = self._clean_for_json(
             {
                 "meta": {
@@ -176,7 +242,7 @@ class ReportEvidenceBuilderAgent(BaseAgent):
                     "stage": self.stage,
                     "version": self.version,
                     "created_at_utc": self._now_utc(),
-                    "purpose": "TOP10 후보별 리포트 근거 구조화",
+                    "purpose": "TOP10 후보별 리포트 근거 구조화 및 RAG 기반 source-grounded evidence 연결",
                 },
                 "as_of_date": candidate_result.get("as_of_date")
                 or self._extract_market_flow(market_flow_result).get("as_of_date"),
@@ -186,7 +252,18 @@ class ReportEvidenceBuilderAgent(BaseAgent):
                     market_flow_result,
                     market_analysis_result,
                 ),
+
+                # 핵심 output
                 "top10_evidence": evidence_items,
+
+                # Ours B에서 ReportGenerativeAgent가 바로 참조할 수 있는 top-level RAG evidence
+                "source_grounded_evidence": all_source_grounded_evidence,
+                "rag_evidence_summary": self._build_rag_evidence_summary(
+                    news_result=news_result,
+                    evidence_items=evidence_items,
+                    source_grounded_evidence=all_source_grounded_evidence,
+                ),
+
                 "glossary_terms": self._build_glossary_terms(),
                 "data_limitations": self._build_data_limitations(candidate_result, evidence_items),
                 "source_trace": self._build_source_trace(paths),
@@ -207,6 +284,8 @@ class ReportEvidenceBuilderAgent(BaseAgent):
             str(artifacts.manifest_path),
         ]
 
+        rag_summary = result.get("rag_evidence_summary", {}) or {}
+
         metrics = {
             "n_candidates": len(evidence_items),
             "as_of_date": result.get("as_of_date"),
@@ -215,6 +294,7 @@ class ReportEvidenceBuilderAgent(BaseAgent):
             "has_finance": paths["finance"] is not None,
             "has_foreign": paths["foreign"] is not None,
             "has_news_result": paths["news_invest_result"] is not None,
+            "has_news_rag_result": paths["news_rag_result"] is not None,
             "has_risk_result": paths["risk_score_result"] is not None,
             "has_market_analysis_result": paths["market_analysis_result"] is not None,
             "n_candidates_with_news_3": sum(
@@ -227,6 +307,15 @@ class ReportEvidenceBuilderAgent(BaseAgent):
                 for item in evidence_items
                 if item.get("data_quality", {}).get("chart_points", 0) > 0
             ),
+            "n_candidates_with_rag_evidence": sum(
+                1
+                for item in evidence_items
+                if item.get("data_quality", {}).get("rag_evidence_count", 0) > 0
+            ),
+            "n_source_grounded_evidence": len(all_source_grounded_evidence),
+            "rag_enabled": rag_summary.get("rag_enabled"),
+            "rag_retrieved_evidence_count": rag_summary.get("retrieved_evidence_count"),
+            "rag_source_grounded_evidence_count": rag_summary.get("source_grounded_evidence_count"),
         }
 
         outputs = {
@@ -235,7 +324,10 @@ class ReportEvidenceBuilderAgent(BaseAgent):
             "manifest": str(artifacts.manifest_path),
         }
 
-        ctx.logger.info("[ReportEvidenceBuilderAgent] Completed report evidence building.")
+        ctx.logger.info(
+            "[ReportEvidenceBuilderAgent] Completed report evidence building. "
+            f"source_grounded_evidence={len(all_source_grounded_evidence)}"
+        )
 
         return self._make_stage_result(
             status="success",
@@ -243,6 +335,10 @@ class ReportEvidenceBuilderAgent(BaseAgent):
             metrics=metrics,
             outputs=outputs,
         )
+
+    # ============================================================
+    # Input Path Resolution
+    # ============================================================
 
     def _resolve_input_paths(self, run_dir: Path, ctx: RunContext) -> Dict[str, Optional[Path]]:
         paths = {
@@ -262,8 +358,12 @@ class ReportEvidenceBuilderAgent(BaseAgent):
                 ctx,
             ),
             "news_invest_result": (
-                self._find_single_file(run_dir, "news_invest_rag_result.json", ctx)
-                or self._find_single_file(run_dir, "news_invest_result.json", ctx)
+                self._find_single_file(run_dir, "news_invest_result.json", ctx)
+                or self._find_single_file(run_dir, "news_investigation_result.json", ctx)
+            ),
+            "news_rag_result": (
+                self._find_single_file(run_dir, "news_rag_result.json", ctx)
+                or self._find_single_file(run_dir, "news_invest_rag_result.json", ctx)
             ),
             "risk_score_result": self._find_single_file(
                 run_dir,
@@ -304,6 +404,10 @@ class ReportEvidenceBuilderAgent(BaseAgent):
             )
 
         return paths
+
+    # ============================================================
+    # Loaders
+    # ============================================================
 
     def _load_json_required(self, path: Optional[Path], ctx: RunContext) -> Dict[str, Any]:
         if path is None or not path.exists():
@@ -391,12 +495,391 @@ class ReportEvidenceBuilderAgent(BaseAgent):
 
         return matches[0]
 
+    # ============================================================
+    # RAG Evidence Handling
+    # ============================================================
+
+    def _merge_news_and_rag_payload(
+        self,
+        primary_news_result: Dict[str, Any],
+        rag_payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        primary_news_result = primary_news_result or {}
+        rag_payload = rag_payload or {}
+
+        if not isinstance(primary_news_result, dict):
+            primary_news_result = {}
+
+        if not isinstance(rag_payload, dict):
+            rag_payload = {}
+
+        merged = dict(primary_news_result)
+
+        if rag_payload:
+            # news_rag_result.json은 보통 RAG payload 자체임
+            if "rag" not in merged:
+                merged["rag"] = rag_payload
+            elif isinstance(merged.get("rag"), dict):
+                tmp = dict(rag_payload)
+                tmp.update(merged["rag"])
+                merged["rag"] = tmp
+
+            for key in [
+                "retrieval_queries",
+                "retrieved_evidence",
+                "rag_sources",
+                "verification_result",
+            ]:
+                if key not in merged and key in rag_payload:
+                    merged[key] = rag_payload[key]
+
+            merged["rag_enabled"] = bool(
+                merged.get("rag_enabled")
+                or rag_payload.get("enabled")
+                or rag_payload.get("rag_enabled")
+            )
+
+        return merged
+
+    def _build_rag_evidence_map(self, news_result: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
+        evidence_by_ticker: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        seen = set()
+
+        if not isinstance(news_result, dict):
+            return {}
+
+        payloads = [news_result]
+
+        if isinstance(news_result.get("rag"), dict):
+            payloads.append(news_result["rag"])
+
+        # 1) top-level RAG evidence
+        for payload in payloads:
+            for ev in payload.get("retrieved_evidence", []) or []:
+                self._add_rag_evidence_to_map(ev, evidence_by_ticker, seen)
+
+        # 2) ticker-level RAG evidence
+        for ticker_item in news_result.get("tickers", []) or []:
+            if not isinstance(ticker_item, dict):
+                continue
+
+            ticker_level_rag = ticker_item.get("rag", {}) or {}
+            if not isinstance(ticker_level_rag, dict):
+                continue
+
+            for ev in ticker_level_rag.get("retrieved_evidence", []) or []:
+                if isinstance(ev, dict) and not ev.get("ticker"):
+                    ev = dict(ev)
+                    ev["ticker"] = ticker_item.get("ticker")
+
+                self._add_rag_evidence_to_map(ev, evidence_by_ticker, seen)
+
+        # 정렬
+        for ticker, items in evidence_by_ticker.items():
+            items.sort(
+                key=lambda x: (
+                    self._safe_float(x.get("final_score")) or 0.0,
+                    self._safe_float(x.get("directness_score")) or 0.0,
+                    self._safe_float(x.get("retrieval_score")) or self._safe_float(x.get("score")) or 0.0,
+                ),
+                reverse=True,
+            )
+
+        return dict(evidence_by_ticker)
+
+    def _add_rag_evidence_to_map(
+        self,
+        ev: Any,
+        evidence_by_ticker: Dict[str, List[Dict[str, Any]]],
+        seen: set,
+    ) -> None:
+        if not isinstance(ev, dict):
+            return
+
+        relevance = ev.get("evidence_relevance")
+        if relevance and relevance not in self.config.rag_allowed_relevance:
+            return
+
+        if ev.get("keep_as_evidence") is False:
+            return
+
+        ticker = self._normalize_ticker(
+            ev.get("query_ticker")
+            or ev.get("ticker")
+        )
+
+        if not ticker:
+            return
+
+        key = (
+            ticker,
+            ev.get("doc_id"),
+            ev.get("url"),
+            ev.get("title"),
+        )
+
+        if key in seen:
+            return
+
+        seen.add(key)
+        evidence_by_ticker[ticker].append(ev)
+
+    def _select_rag_evidence_for_ticker(
+        self,
+        ticker: str,
+        rag_evidence_map: Dict[str, List[Dict[str, Any]]],
+        max_evidence: int = 3,
+    ) -> List[Dict[str, Any]]:
+        ticker = self._normalize_ticker(ticker)
+
+        if not ticker:
+            return []
+
+        items = rag_evidence_map.get(ticker, []) or []
+
+        return items[:max_evidence]
+
+    def _build_source_grounded_evidence(
+        self,
+        ticker: str,
+        candidate: Dict[str, Any],
+        rag_evidence: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        result = []
+
+        company_name = (
+            candidate.get("company_name")
+            or candidate.get("company")
+            or candidate.get("name")
+        )
+
+        for idx, ev in enumerate(rag_evidence, start=1):
+            title = ev.get("title")
+            description = ev.get("description") or ev.get("summary_optional") or ev.get("snippet")
+            relevance = ev.get("evidence_relevance")
+
+            if not title:
+                continue
+
+            claim = self._build_claim_from_rag_evidence(
+                company_name=company_name or ev.get("company"),
+                title=title,
+                relevance=relevance,
+                event_hits=ev.get("event_hits", []),
+            )
+
+            result.append(
+                self._clean_for_json(
+                    {
+                        "rank": idx,
+                        "support_type": "rag_verified_news",
+                        "ticker": ticker,
+                        "company_name": company_name or ev.get("company"),
+                        "claim": claim,
+
+                        "evidence_relevance": relevance,
+                        "directness_score": ev.get("directness_score"),
+                        "final_score": ev.get("final_score"),
+                        "retrieval_score": ev.get("retrieval_score") or ev.get("score"),
+                        "verification_reasons": ev.get("verification_reasons", []),
+                        "event_hits": ev.get("event_hits", []),
+
+                        "title": title,
+                        "summary_optional": description,
+                        "press": ev.get("press") or ev.get("source"),
+                        "published_at": ev.get("date") or ev.get("published_at") or ev.get("pubDate"),
+                        "url": ev.get("url"),
+                        "source_path": ev.get("source_path"),
+                        "doc_id": ev.get("doc_id"),
+                    }
+                )
+            )
+
+        return result
+
+    def _build_claim_from_rag_evidence(
+        self,
+        company_name: Any,
+        title: str,
+        relevance: Optional[str],
+        event_hits: Any,
+    ) -> str:
+        company = str(company_name or "").strip()
+        title = str(title or "").strip()
+
+        event_hits_list = []
+        if isinstance(event_hits, list):
+            event_hits_list = [str(x) for x in event_hits if x]
+        elif event_hits:
+            event_hits_list = [str(event_hits)]
+
+        event_text = ""
+        if event_hits_list:
+            event_text = f" 주요 이벤트 키워드는 {', '.join(event_hits_list[:3])}입니다."
+
+        if relevance == "direct_company_news":
+            if company:
+                return f"{company}와 직접 관련된 뉴스로 '{title}' 기사가 확인되었습니다.{event_text}"
+            return f"해당 종목과 직접 관련된 뉴스로 '{title}' 기사가 확인되었습니다.{event_text}"
+
+        if relevance == "direct_business_relation":
+            if company:
+                return f"{company}은/는 사업 관계 또는 시장 이벤트 맥락에서 언급된 '{title}' 기사가 확인되었습니다.{event_text}"
+            return f"해당 종목이 사업 관계 또는 시장 이벤트 맥락에서 언급된 '{title}' 기사가 확인되었습니다.{event_text}"
+
+        if company:
+            return f"{company} 관련 뉴스로 '{title}' 기사가 확인되었습니다.{event_text}"
+
+        return f"관련 뉴스로 '{title}' 기사가 확인되었습니다.{event_text}"
+
+    def _build_rag_supported_claims(
+        self,
+        ticker: str,
+        candidate: Dict[str, Any],
+        source_grounded_evidence: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        claims = []
+
+        for ev in source_grounded_evidence:
+            claims.append(
+                self._clean_for_json(
+                    {
+                        "ticker": ticker,
+                        "company_name": candidate.get("company_name") or ev.get("company_name"),
+                        "claim": ev.get("claim"),
+                        "support_type": ev.get("support_type"),
+                        "evidence_relevance": ev.get("evidence_relevance"),
+                        "source_title": ev.get("title"),
+                        "source_press": ev.get("press"),
+                        "source_url": ev.get("url"),
+                        "directness_score": ev.get("directness_score"),
+                    }
+                )
+            )
+
+        return claims
+
+    def _build_rag_evidence_snapshot(
+        self,
+        rag_evidence: List[Dict[str, Any]],
+        source_grounded_evidence: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        relevance_counts = Counter(
+            ev.get("evidence_relevance")
+            for ev in rag_evidence
+            if ev.get("evidence_relevance")
+        )
+
+        grounded_relevance_counts = Counter(
+            ev.get("evidence_relevance")
+            for ev in source_grounded_evidence
+            if ev.get("evidence_relevance")
+        )
+
+        return {
+            "available_rag_evidence_count": len(rag_evidence),
+            "source_grounded_evidence_count": len(source_grounded_evidence),
+            "available_relevance_counts": dict(relevance_counts),
+            "grounded_relevance_counts": dict(grounded_relevance_counts),
+            "status": "supported" if source_grounded_evidence else "no_verified_rag_evidence",
+        }
+
+    def _flatten_source_grounded_evidence(
+        self,
+        evidence_items: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        flattened = []
+
+        for item in evidence_items:
+            ticker = item.get("ticker")
+            company_name = item.get("company_name")
+            rank = item.get("rank")
+
+            for ev in item.get("source_grounded_evidence", []) or []:
+                record = dict(ev)
+                record["candidate_rank"] = rank
+                record["candidate_ticker"] = ticker
+                record["candidate_company_name"] = company_name
+                flattened.append(record)
+
+        return flattened
+
+    def _build_rag_evidence_summary(
+        self,
+        news_result: Dict[str, Any],
+        evidence_items: List[Dict[str, Any]],
+        source_grounded_evidence: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        news_result = news_result or {}
+        rag_payload = news_result.get("rag", {}) if isinstance(news_result.get("rag"), dict) else {}
+
+        verification_result = (
+            news_result.get("verification_result")
+            if isinstance(news_result.get("verification_result"), dict)
+            else rag_payload.get("verification_result", {})
+        )
+
+        retrieved_evidence = (
+            news_result.get("retrieved_evidence")
+            if isinstance(news_result.get("retrieved_evidence"), list)
+            else rag_payload.get("retrieved_evidence", [])
+        )
+
+        retrieval_queries = (
+            news_result.get("retrieval_queries")
+            if isinstance(news_result.get("retrieval_queries"), list)
+            else rag_payload.get("retrieval_queries", [])
+        )
+
+        source_relevance_counts = Counter(
+            ev.get("evidence_relevance")
+            for ev in source_grounded_evidence
+            if ev.get("evidence_relevance")
+        )
+
+        candidate_coverage = []
+        for item in evidence_items:
+            candidate_coverage.append(
+                {
+                    "rank": item.get("rank"),
+                    "ticker": item.get("ticker"),
+                    "company_name": item.get("company_name"),
+                    "source_grounded_evidence_count": len(item.get("source_grounded_evidence", []) or []),
+                    "rag_status": item.get("rag_evidence_snapshot", {}).get("status"),
+                }
+            )
+
+        return self._clean_for_json(
+            {
+                "rag_enabled": bool(
+                    news_result.get("rag_enabled")
+                    or news_result.get("meta", {}).get("rag_enabled", False)
+                    or rag_payload.get("enabled", False)
+                    or source_grounded_evidence
+                ),
+                "rag_method": rag_payload.get("method") or news_result.get("meta", {}).get("rag_method"),
+                "retrieval_query_count": len(retrieval_queries) if isinstance(retrieval_queries, list) else None,
+                "retrieved_evidence_count": len(retrieved_evidence) if isinstance(retrieved_evidence, list) else None,
+                "source_grounded_evidence_count": len(source_grounded_evidence),
+                "source_grounded_relevance_counts": dict(source_relevance_counts),
+                "verification_result": verification_result,
+                "candidate_coverage": candidate_coverage,
+            }
+        )
+
+    # ============================================================
+    # Mapping / Data Building
+    # ============================================================
+
     def _build_ticker_map(self, items: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
         result = {}
+
         for item in items:
             ticker = self._normalize_ticker(item.get("ticker"))
+
             if ticker:
                 result[ticker] = item
+
         return result
 
     def _build_latest_row_map(
@@ -614,11 +1097,12 @@ class ReportEvidenceBuilderAgent(BaseAgent):
         candidate: Dict[str, Any],
         news_item: Dict[str, Any],
         raw_news_df: pd.DataFrame,
+        rag_evidence: Optional[List[Dict[str, Any]]] = None,
         max_news: int = 3,
     ) -> List[Dict[str, Any]]:
         collected = []
 
-        def add_article(article: Dict[str, Any]) -> None:
+        def add_article(article: Dict[str, Any], source_type: str = "internal_news") -> None:
             if not isinstance(article, dict):
                 return
 
@@ -646,12 +1130,27 @@ class ReportEvidenceBuilderAgent(BaseAgent):
                         or article.get("date")
                         or article.get("pubDate"),
                         "url": url,
-                        "summary_optional": article.get("summary") or article.get("description"),
+                        "summary_optional": article.get("summary")
+                        or article.get("description")
+                        or article.get("snippet"),
                         "article_score": article.get("article_score"),
                         "rule_score_0_1": article.get("rule_score_0_1"),
+
+                        # RAG source metadata
+                        "source_type": source_type,
+                        "support_type": "rag_verified_news" if source_type == "rag_verified_news" else None,
+                        "evidence_relevance": article.get("evidence_relevance"),
+                        "directness_score": article.get("directness_score"),
+                        "verification_reasons": article.get("verification_reasons"),
                     }
                 )
             )
+
+        for ev in rag_evidence or []:
+            add_article(ev, source_type="rag_verified_news")
+
+            if len(collected) >= max_news:
+                return collected[:max_news]
 
         for article in candidate.get("top_articles", []) or []:
             add_article(article)
@@ -682,6 +1181,7 @@ class ReportEvidenceBuilderAgent(BaseAgent):
         candidate: Dict[str, Any],
         market_item: Dict[str, Any],
         risk_item: Dict[str, Any],
+        rag_supported_claims: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         component_scores = candidate.get("component_scores", {}) or {}
 
@@ -720,7 +1220,12 @@ class ReportEvidenceBuilderAgent(BaseAgent):
         supporting_reasons = self._merge_unique_strings(
             candidate.get("positive_evidence", []),
             market_item.get("positive_factors", []),
-            limit=5,
+            [
+                claim.get("claim")
+                for claim in (rag_supported_claims or [])
+                if isinstance(claim, dict) and claim.get("claim")
+            ],
+            limit=6,
         )
 
         if not supporting_reasons and candidate.get("ranking_reason_short"):
@@ -768,6 +1273,11 @@ class ReportEvidenceBuilderAgent(BaseAgent):
                     ],
                     "all_component_scores": component_scores,
                 },
+                "rag_grounding_note": (
+                    "RAG verified news evidence is available."
+                    if rag_supported_claims else
+                    "No verified RAG evidence was attached for this candidate."
+                ),
                 "original_ranking_reason_short": candidate.get("ranking_reason_short"),
             }
         )
@@ -777,7 +1287,9 @@ class ReportEvidenceBuilderAgent(BaseAgent):
         actual_data: Dict[str, Any],
         chart_data: Dict[str, Any],
         top_news_3: List[Dict[str, Any]],
+        source_grounded_evidence: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
+        source_grounded_evidence = source_grounded_evidence or []
         missing_fields = []
 
         for key, value in actual_data.items():
@@ -795,8 +1307,10 @@ class ReportEvidenceBuilderAgent(BaseAgent):
         return {
             "chart_points": n_chart_points,
             "news_count": len(top_news_3),
+            "rag_evidence_count": len(source_grounded_evidence),
             "missing_fields": missing_fields,
             "news_status": "ok" if len(top_news_3) >= 3 else "insufficient_articles_available",
+            "rag_status": "supported" if source_grounded_evidence else "no_verified_rag_evidence",
         }
 
     def _build_market_context(
@@ -876,6 +1390,8 @@ class ReportEvidenceBuilderAgent(BaseAgent):
         if not news_item:
             return {}
 
+        rag_info = news_item.get("rag", {}) if isinstance(news_item.get("rag"), dict) else {}
+
         return self._clean_for_json(
             {
                 "news_signal_score": news_item.get("news_signal_score"),
@@ -883,6 +1399,9 @@ class ReportEvidenceBuilderAgent(BaseAgent):
                 "verdict": news_item.get("verdict"),
                 "reasons": news_item.get("reasons", []),
                 "news_summary": news_item.get("news_summary", {}),
+                "rag_verification_status": rag_info.get("verification_status"),
+                "rag_evidence_count": rag_info.get("evidence_count"),
+                "rag_relevance_counts": rag_info.get("relevance_counts", {}),
             }
         )
 
@@ -897,6 +1416,10 @@ class ReportEvidenceBuilderAgent(BaseAgent):
                 "evidence": risk_item.get("evidence", []),
             }
         )
+
+    # ============================================================
+    # Static Report Helpers
+    # ============================================================
 
     def _build_glossary_terms(self) -> List[Dict[str, str]]:
         return [
@@ -939,6 +1462,8 @@ class ReportEvidenceBuilderAgent(BaseAgent):
             "candidate_score는 기대수익률이나 수익 보장 확률이 아닙니다.",
             "입력 데이터에 없는 market_cap, PER 등은 추정하지 않고 null로 처리합니다.",
             "뉴스가 3개 미만인 종목은 확인된 기사 범위 안에서만 제공합니다.",
+            "RAG 기반 source_grounded_evidence는 수집된 뉴스 corpus 안에서 검색·검증된 근거이며, 실시간 외부 웹 검색 결과가 아닙니다.",
+            "direct_business_relation evidence는 해당 기업 자체 뉴스가 아니라 사업 관계 또는 시장 이벤트 맥락의 근거일 수 있습니다.",
         ]
 
         return self._merge_unique_strings(limitations, base, limit=20)
@@ -956,6 +1481,7 @@ class ReportEvidenceBuilderAgent(BaseAgent):
         result_path: Path,
     ) -> Dict[str, Any]:
         evidence_items = result.get("top10_evidence", [])
+        rag_summary = result.get("rag_evidence_summary", {}) or {}
 
         return self._clean_for_json(
             {
@@ -970,12 +1496,15 @@ class ReportEvidenceBuilderAgent(BaseAgent):
                 "summary": {
                     "n_candidates": len(evidence_items),
                     "as_of_date": result.get("as_of_date"),
+                    "rag_enabled": rag_summary.get("rag_enabled"),
+                    "source_grounded_evidence_count": rag_summary.get("source_grounded_evidence_count"),
                     "candidates": [
                         {
                             "rank": item.get("rank"),
                             "ticker": item.get("ticker"),
                             "company_name": item.get("company_name"),
                             "news_count": item.get("data_quality", {}).get("news_count"),
+                            "rag_evidence_count": item.get("data_quality", {}).get("rag_evidence_count"),
                             "chart_points": item.get("data_quality", {}).get("chart_points"),
                             "missing_fields": item.get("data_quality", {}).get("missing_fields", []),
                         }
@@ -984,6 +1513,16 @@ class ReportEvidenceBuilderAgent(BaseAgent):
                 },
             }
         )
+
+    # ============================================================
+    # Utility
+    # ============================================================
+
+    def _ctx_get(self, ctx: RunContext, key: str, default: Any = None) -> Any:
+        if isinstance(ctx, dict):
+            return ctx.get(key, default)
+
+        return getattr(ctx, key, default)
 
     def _normalize_ticker(self, value: Any) -> str:
         if value is None:
