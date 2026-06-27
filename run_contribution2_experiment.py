@@ -1291,7 +1291,7 @@ def run_shared_front_pipeline(
         }
 
     else:
-        data_ingestion_agent = try_init_agent(DataInestionAgent)
+        data_ingestion_agent = try_init_agent(DataIngestionAgent)
 
         ingestion_run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         artifact_run_dir_for_ingestion = Path(artifacts_root) / f"run_id={ingestion_run_id}"
